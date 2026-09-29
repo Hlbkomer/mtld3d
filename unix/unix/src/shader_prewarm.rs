@@ -33,12 +33,13 @@ use mtld3d_shared::{
     mtl_handle::{MTLDeviceKind, MTLRenderPipelineStateKind},
     perf::NanosSetTimer,
 };
+use objc2::rc::autoreleasepool;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     LOG_TARGET,
-    encoder::{StageLibHandles, WarmCache, compile_stage_library, shader_cache_path},
-    unix_call::unix_call,
+    encoder::{StageLibHandles, WarmCache, compile_stage_library},
+    metal::handle::IntoRetained,
 };
 
 /// Start prewarm for one device and return its startup barrier.
@@ -48,8 +49,9 @@ use crate::{
 pub fn spawn(
     device_handle: MetalHandle<MTLDeviceKind>,
     shader_cache: bool,
+    cache_path: Option<std::path::PathBuf>,
 ) -> (PrewarmHandle, Receiver<Option<WarmCache>>) {
-    PrewarmHandle::spawn(move |stop| run(device_handle, stop, shader_cache))
+    PrewarmHandle::spawn(move |stop| run(device_handle, stop, shader_cache, cache_path))
 }
 
 /// The pre-warm body; `shader_cache` is the interface's `shaderCache.enable`.
@@ -57,6 +59,7 @@ fn run(
     device_handle: MetalHandle<MTLDeviceKind>,
     stop: &AtomicBool,
     shader_cache: bool,
+    cache_path: Option<std::path::PathBuf>,
 ) -> Option<WarmCache> {
     if !shader_cache {
         info!(
@@ -67,7 +70,8 @@ fn run(
     }
     let started = Instant::now();
 
-    let Some(path) = shader_cache_path() else {
+    let Some(path) = cache_path else {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET, "shader_cache: no translated game cache path, prewarm disabled");
         return Some(WarmCache::empty());
     };
 
@@ -329,21 +333,26 @@ fn compile_pipeline(
     let mut total_ns = 0;
     let timer = NanosSetTimer::start(&raw mut total_ns);
     let vertex_layouts = pipeline_state::vertex_layouts_from_snapshot(snapshot);
-    let mut params = pipeline_state::params_from_snapshot(&PipelineBuildInputs {
+    let params = pipeline_state::description_from_snapshot(&PipelineBuildInputs {
         snapshot,
         vertex_attrs: recipe.vertex_attrs(),
         vertex_layouts: &vertex_layouts,
-        device_handle,
     });
-    let status = unix_call(&mut params);
-    let pipeline = params.pipeline_handle;
-    let timings = params.timings.into_inner();
+    let mut timings = mtld3d_shared::perf::PipelineTimings::new();
+    let pipeline = autoreleasepool(|_| {
+        let device = device_handle.into_retained()?;
+        crate::metal::create_render_pipeline(&device, &params, &mut timings)
+    });
+    if pipeline.is_none() {
+        error!(target: LOG_TARGET, "failed to create render pipeline");
+    }
+    let success = pipeline.is_some();
     drop(timer);
     PipelineCompilation {
-        pipeline,
+        pipeline: pipeline.unwrap_or(MetalHandle::NULL),
         timings,
         total_ns,
-        success: status == 0 && !pipeline.is_null(),
+        success,
     }
 }
 

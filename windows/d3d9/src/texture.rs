@@ -7,6 +7,7 @@ use mtld3d_core::{
     ids::TextureId,
     level_authority::{LevelAuthorityMask, WritePlan},
     page_box::{PageBox, PageBoxRead},
+    page_box_pool::StagingTake,
     pixel_convert,
     render_scale::{RenderScale, TargetExtent},
     staging_coverage::StagingCoverage,
@@ -37,7 +38,7 @@ use super::{
     D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE,
     com_ref::{ComChild, ComUnknown},
     device::DeviceInner,
-    encoder::{FrameEncoder, TextureInfo, TextureUploadJob},
+    encoder::{TextureInfo, TextureUploadJob},
     null_out,
     private_data::PrivateDataStore,
     surface::{DcLockState, Direct3DSurface9},
@@ -215,7 +216,7 @@ pub struct TextureInner {
     /// page-sized allocation so the encoder can wrap it via
     /// `newBufferWithBytesNoCopy:` (which on non-UMA Macs requires page
     /// alignment for both pointer and length). The game writes through the
-    /// pointer returned by `lock_region_ptr`. At `Unlock`, the upload closure
+    /// pointer returned by `lock_region_ptr`. At `Unlock`, the upload operation
     /// clones the `Arc` — refcount bump, no memcpy — and hands the pointer to
     /// the encoder thread. `lock_region_ptr` decides between `WriteInPlace`
     /// (cast `as_ptr()` to `*mut u8` even when retention queues hold clones —
@@ -478,14 +479,6 @@ impl TextureInner {
             .sum()
     }
 
-    /// Whether `level`'s staging is currently released (placeholder only).
-    ///
-    /// The staging warmup skips such levels: there is no backing worth
-    /// wrapping, and every dropped level of every texture shares one page.
-    pub const fn staging_is_dropped(&self, level: usize) -> bool {
-        self.dropped_staging & (1u32 << level) != 0
-    }
-
     /// Claim `(face, level)` for the GPU: its Metal texture holds pixels staging does not.
     ///
     /// The next write of that subresource's staging resolves the claim, reading
@@ -665,9 +658,26 @@ impl TextureInner {
 
     /// Release `level`'s staging; the in-flight upload keeps its own `Arc`.
     fn drop_staging(&mut self, level: usize) {
-        self.staging[level] = dropped_staging_placeholder();
+        let released = core::mem::replace(&mut self.staging[level], dropped_staging_placeholder());
+        retire_staging(self.device_inner, released);
         self.dropped_staging |= 1u32 << level;
         self.reset_staging_coverage(level);
+    }
+
+    /// Give every staging allocation to the page-box pool at the texture's final release.
+    ///
+    /// A level whose upload is still in flight stays with that upload's
+    /// lease and is parked, if at all, when the lease retires.
+    fn retire_all_staging(&mut self) {
+        let device_inner = self.device_inner;
+        for backing in self.staging.drain(..) {
+            retire_staging(device_inner, backing);
+        }
+        if let Some(cube) = self.cube.as_deref_mut() {
+            for backing in cube.staging.drain(..) {
+                retire_staging(device_inner, backing);
+            }
+        }
     }
 
     /// Forget what the level's staging held, because it no longer holds it.
@@ -694,7 +704,8 @@ impl TextureInner {
         }
         let block_rows = self.mip_heights[level].div_ceil(self.block_h.max(1));
         let len = (self.mip_bytes_per_row[level] as usize).saturating_mul(block_rows as usize);
-        self.staging[level] = Arc::new(new_uninit_page_box(len.max(1)));
+        // The slot holds the shared placeholder, never its last owner.
+        self.staging[level] = Arc::new(take_staging_for(self.device_inner, len.max(1)));
         self.dropped_staging &= !(1u32 << level);
         self.reset_staging_coverage(level);
         // The allocation is fresh, so no GPU-visible command references it and
@@ -855,11 +866,14 @@ impl TextureInner {
         let texture_id = self.texture_id;
         let dev = DeviceInner::from_ptr(self.device_inner);
         let slot = Arc::new(core::sync::atomic::AtomicU64::new(0));
-        let slot_op = Arc::clone(&slot);
-        dev.push_op(Box::new(move |enc| {
-            slot_op.store(enc.get_texture_handle_by_id(texture_id), Ordering::Release);
-        }));
-        dev.flush_current_frame_blocking();
+        let slot_op = Arc::clone(&slot).into();
+        dev.push_control(crate::device::ReadTextureHandleOp {
+            texture_id,
+            slot_op,
+        });
+        if dev.flush_current_frame_blocking().is_err() {
+            return false;
+        }
         let handle = slot.load(Ordering::Acquire);
         if handle == 0 {
             return false;
@@ -1011,21 +1025,6 @@ impl TextureInner {
     /// flush, and the cross-device rehydrate.
     pub const fn is_cpu_only(&self) -> bool {
         self.flags.contains(TextureFlags::CPU_ONLY)
-    }
-
-    /// How many per-mip staging buffers to wrap in an `MTLBuffer` eagerly.
-    ///
-    /// Zero for a cube map, whose staging is face-major in the cube sidecar,
-    /// and for a volume texture, whose box upload carries its own `Arc`;
-    /// neither has a per-level wrapper for the encoder to reuse.
-    pub fn staging_warmup_levels(&self) -> u32 {
-        if self
-            .flags
-            .intersects(TextureFlags::CUBE.union(TextureFlags::VOLUME_TEXTURE))
-        {
-            return 0;
-        }
-        u32::try_from(self.staging.len()).expect("mip count fits u32")
     }
 
     /// Volume (`LockBox`) lock: a writable pointer into the level's single staging buffer.
@@ -2198,7 +2197,7 @@ impl TextureInner {
         seq.load(Ordering::Acquire)
     }
 
-    /// Build a `TextureInfo` snapshot for upload closures and draw-time stage binding capture.
+    /// Build a `TextureInfo` snapshot for upload operations and draw-time stage binding capture.
     pub fn texture_info(&self) -> TextureInfo {
         // Render space: this snapshot is what creates and addresses the Metal
         // texture. `self.width`/`self.height` stay logical for `GetLevelDesc`
@@ -2242,28 +2241,10 @@ impl TextureInner {
 
     /// Clone the staging `Arc` for this mip.
     ///
-    /// Cheap (refcount bump) — used by the upload closure to keep the bytes
-    /// alive until the encoder thread blits them to the texture, and by
-    /// `push_texture_warmups` (device.rs) to populate
-    /// `StagingWarmupEntry.keepalive` so the staging `MTLBuffer` wrapper
-    /// survives a same-frame `texture_release`.
+    /// The upload retains these bytes through encoding and GPU retirement. A cached
+    /// staging wrapper keeps its own native owner until the wrapper is destroyed.
     pub fn staging_arc(&self, level: usize) -> Arc<PageBox> {
         Arc::clone(&self.staging[level])
-    }
-
-    /// Raw backing pointer of mip `level`'s staging `PageBox`.
-    ///
-    /// For `CreateTexture`-time staging-buffer warmup. Address stays valid
-    /// until the next Lock(DISCARD) rename swaps the Arc.
-    pub fn staging_backing_ptr(&self, level: usize) -> u64 {
-        self.staging[level].as_ptr() as u64
-    }
-
-    /// Page-aligned length of mip `level`'s staging `PageBox`.
-    ///
-    /// Pairs with `staging_backing_ptr` for `BufferCreateDesc::length`.
-    pub fn staging_backing_len(&self, level: usize) -> u64 {
-        self.staging[level].len() as u64
     }
 
     /// Base, page-aligned length and row stride of one subresource's staging.
@@ -2423,7 +2404,7 @@ impl TextureInner {
                 let mip_len = cube.staging[index].logical_len();
                 let old = core::mem::replace(
                     &mut cube.staging[index],
-                    Arc::new(new_uninit_page_box(mip_len)),
+                    Arc::new(take_staging_for(device_inner, mip_len)),
                 );
                 if preserve == PreserveKind::Cpu {
                     let dst = Arc::get_mut(&mut cube.staging[index])
@@ -2433,6 +2414,7 @@ impl TextureInner {
                     // and both contain `mip_len` logical bytes.
                     unsafe { core::ptr::copy_nonoverlapping(old.as_ptr(), dst, mip_len) };
                 }
+                retire_staging(device_inner, old);
                 if device_inner != 0 {
                     let mut perf = DeviceInner::from_ptr(device_inner).perf_mut();
                     match preserve {
@@ -2654,7 +2636,7 @@ impl TextureInner {
                 // No rename, no preserve — same primitive as the
                 // READONLY fast-path above. `PageBox` exposes only
                 // raw-pointer accessors, so no Rust `&[u8]` borrow of
-                // the bytes lives across this cast. Encoder closures
+                // the bytes lives across this cast. Encoder operations
                 // hold Arc clones to keep the staging alive while
                 // they construct `newBufferWithBytesNoCopy:` MTLBuffer
                 // wrappers; they never borrow the bytes themselves.
@@ -2701,7 +2683,7 @@ impl TextureInner {
         );
         // Copy only logical mip bytes, excluding the page-padded tail.
         let mip_len = self.staging[level].logical_len();
-        let fresh = new_uninit_page_box(mip_len);
+        let fresh = take_staging_for(self.device_inner, mip_len);
         let old = core::mem::replace(&mut self.staging[level], Arc::new(fresh));
         // A detached texture has no live device profiling state.
         let dev_inner_raw = self.device_inner;
@@ -2739,6 +2721,7 @@ impl TextureInner {
                 }
             }
         }
+        retire_staging(dev_inner_raw, old);
         if perf_attached {
             DeviceInner::from_ptr(dev_inner_raw)
                 .perf_mut()
@@ -2955,7 +2938,7 @@ impl TextureInner {
     }
 }
 
-/// Allocate `len` uninitialized bytes in a page-aligned `PageBox`.
+/// Take uninitialized page-aligned staging, a parked box of each size first.
 ///
 /// Used by the `FreshBox` Lock path and by `CreateTexture` for initial
 /// staging — the game writes the dirty rect before any GPU read, and
@@ -2963,14 +2946,45 @@ impl TextureInner {
 /// are never observed. On an initial Draw-before-Lock, the freshly-
 /// created `MTLTexture` is the GPU-visible surface and is zeroed by
 /// Metal; the staging `PageBox` is only read when an upload blit fires,
-/// which requires a prior Lock write.
+/// which requires a prior Lock write. A box popped from the page-box
+/// pool carries another texture's stale bytes under exactly that
+/// contract, so it is interchangeable with a fresh allocation.
 ///
 /// Page-aligned because the encoder wraps the staging via
 /// `newBufferWithBytesNoCopy:`, which on non-UMA Macs (Intel/AMD)
 /// rejects misaligned pointer or length. Apple Silicon tolerates the
-/// misalignment in practice but documents the same contract.
-pub fn new_uninit_page_box(len: usize) -> PageBox {
-    PageBox::new_uninit(len)
+/// misalignment in practice but documents the same contract; a pooled
+/// box has the same alignment and padded length as a fresh one.
+pub fn take_staging() -> StagingTake<'static> {
+    crate::page_box_pool::PAGEBOX_POOL.take_staging()
+}
+
+/// Drop one owner of a staging box, parking it in the page-box pool if it was the last.
+///
+/// Every site where `TextureInner` gives up a staging `Arc` comes through
+/// here. An upload still in flight holds its own `Arc`, so the box stays
+/// with it and is parked, if at all, when that lease retires. A detached
+/// texture (`device_inner == 0`) drops instead: its device drained the
+/// staging lane at teardown, and parking afterwards would undo that.
+pub fn retire_staging(device_inner: u64, backing: Arc<PageBox>) {
+    if device_inner != 0 {
+        crate::page_box_pool::PAGEBOX_POOL.recycle_staging(backing);
+    }
+}
+
+/// One staging allocation, counted on the owning device when the texture still has one.
+fn take_staging_for(device_inner: u64, len: usize) -> PageBox {
+    let (page, (hits, misses)) = {
+        let mut take = take_staging();
+        let page = take.take(len);
+        (page, take.finish())
+    };
+    if device_inner != 0 {
+        DeviceInner::from_ptr(device_inner)
+            .perf_mut()
+            .add_texture_pool_outcomes(hits, misses);
+    }
+    page
 }
 
 /// Parameters for `Direct3DTexture9::new`.
@@ -3371,14 +3385,12 @@ unsafe fn finalize_texture(this: *mut Direct3DTexture9) {
     // `device_inner == 0` after `detach_from_device` — the owning
     // device has already been released and torn down (its
     // `shutdown_cleanup` already drained the texture cache + freed
-    // the matching `MTLTexture`). No closure to push, no live
+    // the matching `MTLTexture`). No operation to push, no live
     // registry to drop from. Just free the PE-side allocations.
     if dev_inner_raw != 0 {
         let dev = DeviceInner::from_ptr(dev_inner_raw);
-        // Push cleanup closure to encoder thread — it owns the Metal handle
-        dev.push_op(Box::new(move |enc| {
-            enc.destroy_cached_texture(texture_id);
-        }));
+        // Push cleanup operation to encoder thread — it owns the Metal handle
+        dev.push_control(crate::device::DestroyTextureOp { tex_id: texture_id });
         // Drop from the live-textures registry before freeing the
         // inner Box so `evict_managed_resources` never sees a dangling
         // pointer.
@@ -3409,6 +3421,8 @@ unsafe fn finalize_texture(this: *mut Direct3DTexture9) {
     // (The texture outlives every shell referencing it, so this is the last
     // owner, and the shells were freed just above.)
     ti_mut.dc_lock.teardown();
+    // Offer the staging to the page-box pool; a detached texture drops it.
+    ti_mut.retire_all_staging();
     // SAFETY: both counters reached zero; `inner_ptr` is the original
     // `Box::into_raw(TextureInner)` from `Self::new` and no other
     // reference can survive.
@@ -3720,9 +3734,7 @@ extern "system" fn texture_generate_mip_sub_levels(this: *mut c_void) {
     if upload_regenerates {
         return;
     }
-    dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
-        enc.run_generate_mipmaps(texture_id);
-    }));
+    dev.push_control(crate::device::GenerateMipmapsOp { texture_id });
 }
 
 // ── IDirect3DTexture9 ──
@@ -3867,18 +3879,14 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
     // handle inside an op and read it back through an atomic slot once the
     // flush has drained the queue.
     let slot = Arc::new(core::sync::atomic::AtomicU64::new(0));
-    let slot_op = Arc::clone(&slot);
-    dev.push_op(Box::new(move |enc| {
-        let handle = enc.get_texture_handle_by_id(texture_id);
-        slot_op.store(handle, Ordering::Release);
-        // The store-action optimiser would drop the colour store of a pass
-        // nothing samples in-frame, and the claim this read resolves is exactly
-        // what such a pass wrote, so note the read before the flush decides.
-        // SAFETY: `handle` is a live retained `MTLTexture` handle from the
-        // encoder texture cache, or zero, which the note ignores.
-        enc.note_color_read_back(unsafe { MetalHandle::<MTLTextureKind>::new(handle) });
-    }));
-    dev.flush_current_frame_blocking();
+    let slot_op = Arc::clone(&slot).into();
+    dev.push_control(crate::device::ReadTextureColorHandleOp {
+        texture_id,
+        slot_op,
+    });
+    if dev.flush_current_frame_blocking().is_err() {
+        return false;
+    }
     let handle = slot.load(Ordering::Acquire);
     if handle == 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
@@ -4382,11 +4390,11 @@ fn parse_rect(rect: *const c_void, mip_w: u32, mip_h: u32) -> Option<DirtyRect> 
     })
 }
 
-/// Build the upload closure and push it onto the current frame's op list.
+/// Build the upload operation and push it onto the current frame's op list.
 ///
-/// The closure holds an `Arc` clone of the staging mip plus a snapshot of
+/// The operation holds an `Arc` clone of the staging mip plus a snapshot of
 /// the D3D9 format / pitch / bpp — refcount bump, zero memcpy on the API
-/// thread. The encoder thread runs it in order relative to draw closures.
+/// thread. The encoder thread runs it in order relative to draw operations.
 ///
 /// Also stamps the current submit seq onto the mip's `last_submit_seq`
 /// so a later `LockRect` can detect GPU-in-flight contention the same
@@ -4480,16 +4488,19 @@ fn schedule_upload_with_order<const ORDERED: bool>(
         rect.w,
         rect.h
     );
-    dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
-        if ORDERED {
-            enc.run_ordered_texture_upload(job);
-        } else {
-            enc.run_texture_upload(job);
-        }
-        if regen_mipmaps {
-            enc.run_generate_mipmaps(texture_id);
-        }
-    }));
+    dev.push_control(crate::device::UploadTextureAndMipsOp {
+        job,
+        texture_id,
+        flags: {
+            let mut flags = crate::device::UploadTextureOpFlags::empty();
+            flags.set(crate::device::UploadTextureOpFlags::ORDERED, ORDERED);
+            flags.set(
+                crate::device::UploadTextureOpFlags::REGENERATE_MIPMAPS,
+                regen_mipmaps,
+            );
+            flags
+        },
+    });
 }
 
 fn schedule_cube_upload(
@@ -4541,9 +4552,7 @@ fn schedule_cube_upload(
         release_staging: false,
         upload_generation: 0,
     };
-    dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
-        enc.run_texture_upload(job);
-    }));
+    dev.push_control(crate::device::UploadTextureOp { job });
 }
 
 /// Re-mark a subresource whose upload the encoder emitted nothing for.
@@ -4749,7 +4758,7 @@ fn rehydrate_for_device_slow(tex: &mut Direct3DTexture9, dev: &mut DeviceInner, 
     // triggered this rehydrate call. A system-memory texture has no Metal
     // texture on any device, so it seeds nothing.
     if !ti.is_cpu_only() {
-        dev.push_texture_warmup(ti.texture_info());
+        dev.push_texture_warmup(&ti.texture_info());
     }
     let adopted = if pinned {
         tex.device_forward_target()
@@ -4855,9 +4864,7 @@ fn flush_dirty_mips_slow<const ORDERED: bool>(ti: &mut TextureInner, dev: &mut D
         }
         let texture_id = ti.texture_id;
         if regenerate_mipmaps {
-            dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
-                enc.run_generate_mipmaps(texture_id);
-            }));
+            dev.push_control(crate::device::GenerateMipmapsOp { texture_id });
         }
         mtld3d_shared::log_once_trace_by!(
             target: TEX_TRACE_TARGET, key: texture_id.raw(),

@@ -11,7 +11,7 @@ use rustc_hash::FxHashSet;
 
 use super::*;
 
-const fn sample(enc_cyc: u64, drawable_wait: u64) -> FrameSample {
+pub(super) const fn sample(enc_cyc: u64, drawable_wait: u64) -> FrameSample {
     FrameSample {
         counters: FrameCounters::new(),
         timing: FrameTiming::new(),
@@ -572,6 +572,7 @@ fn summary_golden_layout() {
         "  discards  1                                                   API: rename, no preserve (whole-level DISCARD on a DEFAULT-pool texture)\n",
         "  preserve  1                       peak/frame 1                API: rename + sync memcpy (whole-level non-DISCARD contended, or an unaligned compressed rect)\n",
         "in-place    0                                                   API: contended partial Lock handed back live (kept divergence; no rename, no stall)\n",
+        "pool        hit=7 miss=1 (87.5%)                                API: staging pops a warm same-size PageBox; last owners park retired staging\n",
         "uploads     2                                                   encoder: total texture uploads (raw + padded + pass)\n",
         "  raw       2                                                   encoder: blit; source = cached bytesNoCopy wrapper (cheap)\n",
         "  padded    0                                                   encoder: blit; source repacked on the CPU into a transient buffer (alloc + memcpy + extra unix_call)\n",
@@ -587,7 +588,7 @@ fn summary_golden_layout() {
         "\n",
         "Commands / passes (raw window totals)\n",
         "  passes=4         commands=140         draws=100\n",
-        "  pipeline memo  97 / 100  (97.0%)  consecutive-draw resolve elided\n",
+        "  pipeline memo  97 / 100  (97.0%)  recent-draw resolve elided\n",
         "  fan generated  0         indexed / oversized fans rewritten per draw (slow path; 0 is the goal)\n",
         "  up indexed     3         DrawIndexedPrimitiveUP draws (inline indices copied into the upload ring)\n",
         "  up oversized   2         UP draws past the 4 KiB inline limit (vertices copied into the upload ring)\n",
@@ -714,7 +715,8 @@ fn kv_golden_line() {
         " vbib_retention_peak_count=6 vbib_retained_bytes=3670016 vbib_pool_hit_total=14",
         " vbib_pool_miss_total=1 pagebox_pool_recycled_total=14",
         " pagebox_pool_recycled_bytes_total=688128 pagebox_pool_parked_bytes=1048576",
-        " tex_rename_total=2 tex_discard_total=1 tex_preserve_cpu_total=1",
+        " tex_rename_total=2 tex_discard_total=1 tex_pool_hit_total=7 tex_pool_miss_total=1",
+        " tex_preserve_cpu_total=1",
         " tex_in_place_total=0 tex_uploads_total=2 tex_uploads_raw_total=2",
         " tex_uploads_padded_total=0 tex_uploads_pass_total=0 tex_reorder_total=1",
         " tex_destroy_total=1 tex_retention_peak_count=0 tex_staging_retained_bytes=0",
@@ -964,10 +966,11 @@ fn sample_window() -> PerfWindow {
     scalls[SurfaceSubCategory::Misc as usize] = 15;
     let s = FrameSample {
         counters: FrameCounters {
+            reserved: 0,
             reset_epoch: 0,
-            reset_epoch_saturated: false,
+            reset_epoch_saturated: 0,
             inverse_view: [0; 3],
-            inverse_view_saturated: false,
+            inverse_view_saturated: 0,
             api_cycles_by_category: cats,
             api_call_counts_by_category: calls,
             vb_rename: 12,
@@ -1000,6 +1003,10 @@ fn sample_window() -> PerfWindow {
             texture_discards: 1,
             texture_preserve_cpu: 1,
             texture_write_in_place_contended: 0,
+            // Staging pool fixture: 7 of 8 staging allocations served
+            // warm (87.5%), one fell through to the allocator.
+            texture_pool_hits: 7,
+            texture_pool_misses: 1,
             // AddDirtyRect probe fixture: 4 calls, 3 with a usable
             // sub-region; area sum 10000 bp ⇒ mean coverage 25% of the mip.
             texture_add_dirty_calls: 4,
@@ -1402,7 +1409,7 @@ fn inverse_rates_are_undefined_for_empty_or_saturated_counts() {
     assert!(out.contains("enabled-hit=n/a saturated=false"));
     api.counters.inverse_view[1] = u64::MAX;
     api.record_inverse_view(&InverseViewUse::Hit);
-    assert!(api.counters.inverse_view_saturated);
+    assert!(api.counters.inverse_view_saturated != 0);
     assert_eq!(api.counters.inverse_view[1], u64::MAX);
     api.drain_into_payload(&mut payload);
     s.counters = payload.counters;
@@ -1411,7 +1418,7 @@ fn inverse_rates_are_undefined_for_empty_or_saturated_counts() {
     assert!(out.contains("enabled-hit=n/a saturated=true"));
     // Aggregation overflow is also visible even if each frame fit individually.
     w.reset();
-    s.counters.inverse_view_saturated = false;
+    s.counters.inverse_view_saturated = 0;
     w.accumulate(&s);
     w.accumulate(&s);
     assert!(w.inverse_epochs[0].saturated);
@@ -1419,5 +1426,45 @@ fn inverse_rates_are_undefined_for_empty_or_saturated_counts() {
     api.advance_reset_epoch();
     api.drain_into_payload(&mut payload);
     assert_eq!(payload.counters.reset_epoch, u64::MAX);
-    assert!(payload.counters.reset_epoch_saturated);
+    assert!(payload.counters.reset_epoch_saturated != 0);
+}
+
+#[test]
+fn dispatch_trace_excludes_logger_and_separates_shader_validation_from_compile() {
+    use mtld3d_shared::Thunks;
+
+    assert_eq!(unix_dispatch_kind(Thunks::WriteLog as u32), None);
+    assert_eq!(
+        unix_dispatch_kind(Thunks::SubmitEncoderFrame as u32),
+        Some("enqueue")
+    );
+    // Shader validation and resource creation remain necessary synchronous calls.
+    for thunk in [
+        Thunks::CreateShaderProgram,
+        Thunks::CreateEncoder,
+        Thunks::EncoderControl,
+        Thunks::CreateBackbuffer,
+        Thunks::DestroyEncoder,
+    ] {
+        assert_eq!(unix_dispatch_kind(thunk as u32), Some("sync"));
+    }
+}
+
+#[test]
+fn native_decode_cycles_extend_operations_once_and_reset_next_frame() {
+    let mut state = EncoderPerfState::new();
+    let payload = FramePerfPayload::new();
+    state.begin_frame(&payload);
+    state.set_op_cycles(100);
+    state.set_submit_cycles(25);
+    state.add_op_cycles(40);
+    assert_eq!(state.enc.op_cycles, 140);
+    assert_eq!(state.enc.op_cycles + state.enc.submit_cycles, 165);
+    assert_eq!(
+        state.timing.frame_total_cycles,
+        payload.timing.frame_total_cycles
+    );
+    state.begin_frame(&payload);
+    assert_eq!(state.enc.op_cycles, 0);
+    assert_eq!(state.enc.submit_cycles, 0);
 }
