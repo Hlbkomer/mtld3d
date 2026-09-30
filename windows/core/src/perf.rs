@@ -63,9 +63,9 @@ use strum::EnumCount;
 
 #[cfg(perf_tracking)]
 use super::page_box::{PageBoxVolume, pagebox_volume};
-use super::passes::Pass;
 #[cfg(perf_tracking)]
 use super::passes::{ColorLoad, DepthLoad};
+use super::{passes::Pass, snapshot::SnapshotSection};
 
 #[cfg(perf_tracking)]
 mod clock_scale;
@@ -121,6 +121,92 @@ const LOG_TARGET: &str = "mtld3d::perf";
 /// just rides the same switch.
 #[cfg(perf_tracking)]
 const PASSES_TARGET: &str = "mtld3d::d3d9::passes";
+
+/// Every snapshot section, in bit order: its slot, `perf-kv` key stem and rebuild-table label.
+///
+/// The label is the section's `SnapshotDirty` flag name.
+#[cfg(perf_tracking)]
+const SNAPSHOT_SECTIONS: [(usize, &str, &str); 17] = [
+    (SnapshotSection::Rs as usize, "rs", "RS"),
+    (SnapshotSection::Stages as usize, "stages", "STAGES"),
+    (SnapshotSection::RtDs as usize, "rt_ds", "RT_DS"),
+    (SnapshotSection::Vdecl as usize, "vdecl", "VDECL"),
+    (SnapshotSection::Variant as usize, "variant", "VARIANT"),
+    (SnapshotSection::VsSource as usize, "vs_source", "VS_SOURCE"),
+    (SnapshotSection::PsSource as usize, "ps_source", "PS_SOURCE"),
+    (SnapshotSection::VsConst as usize, "vs_const", "VS_CONST"),
+    (SnapshotSection::PsConst as usize, "ps_const", "PS_CONST"),
+    (SnapshotSection::AlphaRef as usize, "alpha_ref", "ALPHA_REF"),
+    (SnapshotSection::FogColor as usize, "fog_color", "FOG_COLOR"),
+    (SnapshotSection::BumpEnv as usize, "bump_env", "BUMP_ENV"),
+    (
+        SnapshotSection::VsConstI as usize,
+        "vs_const_i",
+        "VS_CONST_I",
+    ),
+    (SnapshotSection::VsDraw as usize, "vs_draw", "VS_DRAW"),
+    (
+        SnapshotSection::VsConstB as usize,
+        "vs_const_b",
+        "VS_CONST_B",
+    ),
+    (
+        SnapshotSection::PsConstI as usize,
+        "ps_const_i",
+        "PS_CONST_I",
+    ),
+    (
+        SnapshotSection::PsConstB as usize,
+        "ps_const_b",
+        "PS_CONST_B",
+    ),
+];
+
+/// One rebuilding draw in this many gets its `keys` sections timed.
+///
+/// A section timer costs about as much as a small section's rebuild (two
+/// counter reads under Rosetta), so timing every draw would inflate `keys`
+/// and the API thread by that much. The sampled cycles are scaled back up by
+/// the rebuilding draws over the sampled ones. A power of two, so the pick
+/// is a mask of the per-device xorshift state.
+#[cfg(perf_tracking)]
+const KEYS_SECTION_SAMPLE_PERIOD: u32 = 16;
+
+/// The six sections the snapshot's `keys` scope times, in the order the draw builds them.
+///
+/// Each entry is the section's slot, its grid label (at most four columns,
+/// what the grid's depth leaves of `LABEL_W`) and its grid description. The
+/// `perf-kv` key stem comes from [`SNAPSHOT_SECTIONS`] through
+/// [`section_stem`].
+#[cfg(perf_tracking)]
+const KEYS_SECTIONS: [(usize, &str, &str); 6] = [
+    (
+        SnapshotSection::Vdecl as usize,
+        "decl",
+        "attrs + FF VS layout",
+    ),
+    (SnapshotSection::Rs as usize, "rs", "render-state struct"),
+    (
+        SnapshotSection::RtDs as usize,
+        "rtds",
+        "depth/stencil flags",
+    ),
+    (
+        SnapshotSection::Variant as usize,
+        "var",
+        "pipeline variant key",
+    ),
+    (
+        SnapshotSection::VsSource as usize,
+        "vs",
+        "FF VS key / VS id",
+    ),
+    (
+        SnapshotSection::PsSource as usize,
+        "ps",
+        "FF PS key / PS id",
+    ),
+];
 
 /// Which COM wrapper type owns the vtable fn wrapping an `ApiTimer`.
 ///
@@ -740,6 +826,20 @@ struct FrameCounters {
     /// `Box::new` of the `emit_draw` closure plus `push_op` append onto
     /// the current frame's op list. Closure-build cost.
     draw_push_op_cycles: u64,
+    /// Per-[`SnapshotSection`] cycles of the section's rebuild block, on the sampled draws only.
+    ///
+    /// Only the six sections inside the `keys` scope (`VDECL`, `RS`,
+    /// `RT_DS`, `VARIANT`, `VS_SOURCE`, `PS_SOURCE`) are timed, each inside
+    /// its section's dirty branch and only on the draws
+    /// `snapshot_sampled_draws` counts, so the other slots stay zero.
+    draw_snapshot_section_cycles: [u64; SnapshotSection::SLOTS],
+    /// The `keys` scope's cycles on the sampled draws only, the parent of the section cycles.
+    ///
+    /// Timed by a second timer inside the `keys` timer, so it contains the
+    /// section timers' cost the same way the section intervals do, and
+    /// `keys_sampled - sections` is what the sampled draws spent in `keys`
+    /// outside the six sections.
+    draw_snapshot_keys_sampled_cycles: u64,
     reset_epoch_saturated: u32,
     inverse_view_saturated: u32,
     /// Per-category call counts for the same frame window.
@@ -860,6 +960,19 @@ struct FrameCounters {
     ///
     /// So they skipped the snapshot rebuild (the `keys` bucket work).
     keys_gate_skips: [u32; KeysGate::COUNT],
+    /// Per-[`SnapshotSection`] count of the draws that rebuilt the section.
+    ///
+    /// One bump per set bit of the dirty mask a draw's snapshot consumed.
+    /// Divided by the draw calls this is the section's rebuild rate.
+    snapshot_rebuilds: [u32; SnapshotSection::SLOTS],
+    /// Per-[`SnapshotSection`] count of the sampled draws that rebuilt the section.
+    ///
+    /// The divisor of a timed section's cost per rebuild.
+    snapshot_sampled_rebuilds: [u32; SnapshotSection::SLOTS],
+    /// Draws whose snapshot had any section dirty; the others reused the encoder's snapshot.
+    snapshot_rebuild_draws: u32,
+    /// Subset of `snapshot_rebuild_draws` whose `keys` sections were timed.
+    snapshot_sampled_draws: u32,
     /// Texture staging allocations served warm from the page-box pool's staging lane.
     ///
     /// With `texture_pool_misses` this renders the textures `pool` row. Both
@@ -917,6 +1030,10 @@ impl FrameCounters {
             surface_sub_calls: [0; SurfaceSubCategory::COUNT],
             keys_gate_calls: [0; KeysGate::COUNT],
             keys_gate_skips: [0; KeysGate::COUNT],
+            snapshot_rebuilds: [0; SnapshotSection::SLOTS],
+            snapshot_sampled_rebuilds: [0; SnapshotSection::SLOTS],
+            snapshot_rebuild_draws: 0,
+            snapshot_sampled_draws: 0,
             draw_snapshot_cycles: 0,
             draw_snapshot_stages_cycles: 0,
             draw_snapshot_c_ff_cycles: 0,
@@ -924,6 +1041,8 @@ impl FrameCounters {
             draw_snapshot_keys_cycles: 0,
             draw_snapshot_bumps_cycles: 0,
             draw_push_op_cycles: 0,
+            draw_snapshot_section_cycles: [0; SnapshotSection::SLOTS],
+            draw_snapshot_keys_sampled_cycles: 0,
         }
     }
 }
@@ -1230,6 +1349,12 @@ pub struct ApiPerfState {
     /// `active_child_cycles` can be reset to 0 at rest (prevents
     /// top-level residue).
     timer_depth: u32,
+    /// Xorshift state that picks the rebuilding draws whose `keys` sections are timed.
+    ///
+    /// Persists across frames and is never drained, so a game or benchmark
+    /// that repeats its draw sequence every frame is not sampled at the same
+    /// positions each time.
+    section_sample_state: u32,
 }
 
 #[cfg(perf_tracking)]
@@ -1250,6 +1375,7 @@ impl ApiPerfState {
             prev_present_rdtsc: 0,
             active_child_cycles: 0,
             timer_depth: 0,
+            section_sample_state: 0x9e37_79b9,
         }
     }
 
@@ -1338,6 +1464,25 @@ impl ApiPerfState {
         &raw mut self.counters.draw_snapshot_bumps_cycles
     }
 
+    /// Pointer the `CycleAddTimer` writes into for one section's rebuild block in the snapshot.
+    ///
+    /// A child of `draw_snapshot_keys_cycles_ptr` for the six sections
+    /// inside the `keys` scope. The timer runs only inside the section's
+    /// dirty branch, so the slot over the section's rebuild count is its
+    /// cost per rebuild.
+    pub const fn draw_snapshot_section_cycles_ptr(&mut self, section: SnapshotSection) -> *mut u64 {
+        &raw mut self.counters.draw_snapshot_section_cycles[section as usize]
+    }
+
+    /// Pointer the `CycleAddTimer` for the `keys` scope of a sampled draw writes into.
+    ///
+    /// The parent of [`Self::draw_snapshot_section_cycles_ptr`] on the same
+    /// draws, so the part of `keys` outside the six sections is measured on
+    /// the draws the sections are.
+    pub const fn draw_snapshot_keys_sampled_cycles_ptr(&mut self) -> *mut u64 {
+        &raw mut self.counters.draw_snapshot_keys_sampled_cycles
+    }
+
     /// Add cycles + one call to the per-category accumulator.
     pub const fn add_api_cycles(&mut self, category: ApiCategory, cycles: u64) {
         let idx = category as usize;
@@ -1421,6 +1566,39 @@ impl ApiPerfState {
             let skips = &mut self.counters.keys_gate_skips[idx];
             *skips = skips.saturating_add(1);
         }
+    }
+
+    /// Record one draw whose snapshot rebuilt the sections set in `dirty_bits`.
+    ///
+    /// `dirty_bits` is the device's snapshot dirty mask, one bit per
+    /// [`SnapshotSection`]; a bit past the last section is ignored. Returns
+    /// whether this draw is one of the sampled ones whose `keys` sections
+    /// the caller times: about one in `KEYS_SECTION_SAMPLE_PERIOD`.
+    pub const fn record_snapshot_rebuild(&mut self, dirty_bits: u32) -> bool {
+        let mut state = self.section_sample_state;
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        self.section_sample_state = state;
+        let sampled = state & (KEYS_SECTION_SAMPLE_PERIOD - 1) == 0;
+        let draws = &mut self.counters.snapshot_rebuild_draws;
+        *draws = draws.saturating_add(1);
+        if sampled {
+            let sampled_draws = &mut self.counters.snapshot_sampled_draws;
+            *sampled_draws = sampled_draws.saturating_add(1);
+        }
+        let mut bits = dirty_bits & ((1 << SnapshotSection::SLOTS) - 1);
+        while bits != 0 {
+            let slot = bits.trailing_zeros() as usize;
+            let count = &mut self.counters.snapshot_rebuilds[slot];
+            *count = count.saturating_add(1);
+            if sampled {
+                let sampled_count = &mut self.counters.snapshot_sampled_rebuilds[slot];
+                *sampled_count = sampled_count.saturating_add(1);
+            }
+            bits &= bits - 1;
+        }
+        sampled
     }
 
     pub const fn bump_vb_rename(&mut self) {
@@ -1620,6 +1798,17 @@ impl ApiPerfState {
     pub const fn draw_snapshot_bumps_cycles_ptr(&mut self) -> *mut u64 {
         core::ptr::null_mut()
     }
+    #[inline]
+    pub const fn draw_snapshot_section_cycles_ptr(
+        &mut self,
+        _section: SnapshotSection,
+    ) -> *mut u64 {
+        core::ptr::null_mut()
+    }
+    #[inline]
+    pub const fn draw_snapshot_keys_sampled_cycles_ptr(&mut self) -> *mut u64 {
+        core::ptr::null_mut()
+    }
 
     #[inline]
     pub const fn add_api_cycles(&mut self, _category: ApiCategory, _cycles: u64) {}
@@ -1630,6 +1819,10 @@ impl ApiPerfState {
 
     #[inline]
     pub const fn record_keys_gate(&mut self, _gate: KeysGate, _skipped: bool) {}
+    #[inline]
+    pub const fn record_snapshot_rebuild(&mut self, _dirty_bits: u32) -> bool {
+        false
+    }
 
     #[inline]
     pub const fn bump_vb_rename(&mut self) {}
@@ -2938,6 +3131,27 @@ struct PerfWindow {
     /// expected; computed per-frame because
     /// peak-of-difference ≠ difference-of-peaks.
     draw_snapshot_leftover: Stat,
+    /// Per-[`SnapshotSection`] rebuild-block cycles of the sampled draws; the `keys` six are timed.
+    ///
+    /// The sum is the raw sampled total, which
+    /// [`Self::draw_snapshot_section_scaled`] scales to all rebuilding draws;
+    /// the peak is the worst frame already scaled by that frame's ratio.
+    draw_snapshot_section: [Stat; SnapshotSection::SLOTS],
+    /// Peak only: the per-frame estimate of `keys` outside its six timed sections.
+    ///
+    /// The frame's sampled `keys` less its sampled sections, scaled by the
+    /// frame's own sampling ratio, so it is an estimate from few draws.
+    draw_snapshot_keys_leftover: Stat,
+    /// The `keys` scope's cycles on the sampled draws (sum only).
+    draw_snapshot_keys_sampled: Stat,
+    /// Per-[`SnapshotSection`] count of the sampled draws that rebuilt it (sum only).
+    snapshot_sampled_rebuilds_by: [Stat; SnapshotSection::SLOTS],
+    /// Per-[`SnapshotSection`] count of the draws that rebuilt it (sum only).
+    snapshot_rebuilds_by: [Stat; SnapshotSection::SLOTS],
+    /// Draws whose snapshot rebuilt any section (sum only).
+    snapshot_rebuild_draws: Stat,
+    /// The subset of `snapshot_rebuild_draws` whose `keys` sections were timed (sum only).
+    snapshot_sampled_draws: Stat,
     draw_push_op: Stat,
     vb_rename: Stat,
     ib_rename: Stat,
@@ -3170,6 +3384,21 @@ impl PerfWindow {
             self.keys_gate_calls_by[i].add(u64::from(s.counters.keys_gate_calls[i]));
             self.keys_gate_skips_by[i].add(u64::from(s.counters.keys_gate_skips[i]));
         }
+        let rebuild_draws = u64::from(s.counters.snapshot_rebuild_draws);
+        let sampled_draws = u64::from(s.counters.snapshot_sampled_draws);
+        for i in 0..SnapshotSection::SLOTS {
+            let cycles = s.counters.draw_snapshot_section_cycles[i];
+            let section = &mut self.draw_snapshot_section[i];
+            section.sum = section.sum.saturating_add(cycles);
+            section.peak(scale_sampled(cycles, rebuild_draws, sampled_draws));
+            self.snapshot_rebuilds_by[i].add(u64::from(s.counters.snapshot_rebuilds[i]));
+            self.snapshot_sampled_rebuilds_by[i]
+                .add(u64::from(s.counters.snapshot_sampled_rebuilds[i]));
+        }
+        self.draw_snapshot_keys_sampled
+            .add(s.counters.draw_snapshot_keys_sampled_cycles);
+        self.snapshot_rebuild_draws.add(rebuild_draws);
+        self.snapshot_sampled_draws.add(sampled_draws);
         self.draw_snapshot.add(s.counters.draw_snapshot_cycles);
         self.draw_snapshot_stages
             .add(s.counters.draw_snapshot_stages_cycles);
@@ -3286,6 +3515,15 @@ impl PerfWindow {
             .saturating_sub(s.counters.draw_snapshot_keys_cycles)
             .saturating_sub(s.counters.draw_snapshot_bumps_cycles);
         self.draw_snapshot_leftover.peak(snapshot_leftover);
+        let keys_leftover = scale_sampled(
+            keys_outside_sections(
+                s.counters.draw_snapshot_keys_sampled_cycles,
+                &s.counters.draw_snapshot_section_cycles,
+            ),
+            rebuild_draws,
+            sampled_draws,
+        );
+        self.draw_snapshot_keys_leftover.peak(keys_leftover);
         let frame_other = s.counters.device_sub_cycles[DeviceSubCategory::Frame as usize]
             .saturating_sub(s.timing.present_block_cycles);
         self.frame_other.peak(frame_other);
@@ -3330,6 +3568,48 @@ impl PerfWindow {
             .saturating_sub(self.draw_snapshot_c_pr.sum)
             .saturating_sub(self.draw_snapshot_keys.sum)
             .saturating_sub(self.draw_snapshot_bumps.sum)
+    }
+
+    /// One section's rebuild-block cycles over the window, scaled from the sampled draws to all.
+    ///
+    /// The sum is the window's estimate for every rebuilding draw, the peak
+    /// the worst frame's.
+    fn draw_snapshot_section_scaled(&self, slot: usize) -> Stat {
+        let section = &self.draw_snapshot_section[slot];
+        Stat {
+            sum: scale_sampled(
+                section.sum,
+                self.snapshot_rebuild_draws.sum,
+                self.snapshot_sampled_draws.sum,
+            ),
+            max: section.max,
+        }
+    }
+
+    /// Window estimate of the snapshot's `keys` scope outside its six timed sections.
+    ///
+    /// Taken on the sampled draws, sampled `keys` less the sampled sections,
+    /// so both sides carry the section timers' cost alike, then scaled like
+    /// the sections. The six sections and this add up to the sampled `keys`
+    /// scaled up, which typically exceeds the parent `keys` row by about what
+    /// the section timers would cost if every rebuilding draw were timed; it
+    /// is an estimate from the sampled draws, so a window can read below.
+    fn draw_snapshot_keys_resid_sum(&self) -> u64 {
+        let mut sections = [0u64; SnapshotSection::SLOTS];
+        for (slot, section) in sections.iter_mut().enumerate() {
+            *section = self.draw_snapshot_section[slot].sum;
+        }
+        scale_sampled(
+            keys_outside_sections(self.draw_snapshot_keys_sampled.sum, &sections),
+            self.snapshot_rebuild_draws.sum,
+            self.snapshot_sampled_draws.sum,
+        )
+    }
+
+    /// A timed section's cycles per sampled rebuild, `None` when it was never sampled.
+    fn draw_snapshot_section_per_rebuild(&self, slot: usize) -> Option<u64> {
+        let rebuilds = self.snapshot_sampled_rebuilds_by[slot].sum;
+        (rebuilds > 0).then(|| self.draw_snapshot_section[slot].sum / rebuilds)
     }
 
     /// Window sum of the encoder's finalize CPU: the submit cycles less the backpressure stall.
@@ -3606,6 +3886,43 @@ const RES_PEAK_COL: usize = 36;
 #[cfg(perf_tracking)]
 const RES_COMMENT_COL: usize = 64;
 
+/// Scale cycles timed on `sampled` of `draws` rebuilding draws up to all of them.
+///
+/// Zero when nothing was sampled. The product is taken in 128 bits, so no
+/// window total overflows it.
+#[cfg(perf_tracking)]
+fn scale_sampled(cycles: u64, draws: u64, sampled: u64) -> u64 {
+    if sampled == 0 {
+        return 0;
+    }
+    let scaled = u128::from(cycles) * u128::from(draws) / u128::from(sampled);
+    u64::try_from(scaled).unwrap_or(u64::MAX)
+}
+
+/// The sampled `keys` cycles less the six timed sections' sampled cycles.
+///
+/// Both are measured on the same draws, the sections nested inside `keys`,
+/// so the difference cannot go negative; the saturation only guards a
+/// counter that wrapped.
+#[cfg(perf_tracking)]
+fn keys_outside_sections(keys_sampled: u64, sections: &[u64; SnapshotSection::SLOTS]) -> u64 {
+    KEYS_SECTIONS
+        .iter()
+        .fold(keys_sampled, |left, &(slot, ..)| {
+            left.saturating_sub(sections[slot])
+        })
+}
+
+/// The `perf-kv` key stem of the section in `slot`, from [`SNAPSHOT_SECTIONS`].
+#[cfg(perf_tracking)]
+fn section_stem(slot: usize) -> &'static str {
+    SNAPSHOT_SECTIONS
+        .iter()
+        .find(|&&(section, ..)| section == slot)
+        .map(|&(_, stem, _)| stem)
+        .expect("every KEYS_SECTIONS slot is in SNAPSHOT_SECTIONS")
+}
+
 /// Compute and format a `(N ns/draw)` aux cell.
 ///
 /// For a row whose cycle accumulator scales with draw count.
@@ -3853,6 +4170,7 @@ impl<'a> Summary<'a> {
         self.write_caches(&mut out);
         self.write_commands_passes(&mut out);
         self.write_keys_gating(&mut out);
+        self.write_snapshot_rebuilds(&mut out);
         self.write_inverse_view(&mut out);
         self.write_alloc_footprint(&mut out);
 
@@ -4246,6 +4564,45 @@ impl<'a> Summary<'a> {
                         aux: ns_per_draw_aux(w.draw_snapshot_keys.sum, draws_total),
                         desc: Some("VDECL+RS+variant+srcs"),
                         peak: Some(cycles_to_ms(w.draw_snapshot_keys.max)),
+                    },
+                );
+                // The six sections `keys` times, each only on a sampled draw
+                // that rebuilds it, and `rest`, the sampled `keys` less those
+                // sections: the reads between the sections plus the part of
+                // the section timers' cost that falls outside their own
+                // intervals. All seven are scaled from the sampled draws, so
+                // they add up to the sampled `keys` scaled up, which typically
+                // exceeds the `keys` row above by about what the section
+                // timers would cost if every rebuilding draw were timed
+                // (an estimate, so a window can read below it). The
+                // peaks are one frame's sampled draws scaled by that frame's
+                // ratio, estimates that read high.
+                for &(slot, label, desc) in &KEYS_SECTIONS {
+                    let section = &w.draw_snapshot_section_scaled(slot);
+                    write_row(
+                        out,
+                        s,
+                        &Row {
+                            label: &format!("│  │  │  │  │  ├─ {label}"),
+                            bold_label: false,
+                            ms: Some(cycles_to_ms(section.sum / f)),
+                            aux: ns_per_draw_aux(section.sum, draws_total),
+                            desc: Some(desc),
+                            peak: Some(cycles_to_ms(section.max)),
+                        },
+                    );
+                }
+                let keys_resid_cyc = w.draw_snapshot_keys_resid_sum();
+                write_row(
+                    out,
+                    s,
+                    &Row {
+                        label: "│  │  │  │  │  └─ rest",
+                        bold_label: false,
+                        ms: Some(cycles_to_ms(keys_resid_cyc / f)),
+                        aux: ns_per_draw_aux(keys_resid_cyc, draws_total),
+                        desc: Some("keys less its parts"),
+                        peak: Some(cycles_to_ms(w.draw_snapshot_keys_leftover.max)),
                     },
                 );
                 write_row(
@@ -5342,6 +5699,59 @@ impl<'a> Summary<'a> {
         }
     }
 
+    /// Per-[`SnapshotSection`] rebuild rate, and the cost of one rebuild of each timed section.
+    ///
+    /// A draw rebuilds the sections its dirty mask carries and reuses the
+    /// encoder's copy of the rest. The per-draw `keys` figure folds how
+    /// often a section is rebuilt together with what one rebuild costs; this
+    /// table separates the two: the share of draw calls that rebuilt each
+    /// section, and for the six sections `keys` times, ns per rebuild.
+    fn write_snapshot_rebuilds(&self, out: &mut String) {
+        use mtld3d_shared::tsc::u64_to_f64_exact;
+        let w = self.w;
+        let s = &self.s;
+        let calls = w.device_sub_calls_by[DeviceSubCategory::Draws as usize].sum;
+        let pct = |n: u64| {
+            if calls > 0 {
+                u64_to_f64_exact(n) / u64_to_f64_exact(calls) * 100.0
+            } else {
+                0.0
+            }
+        };
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "{b}Snapshot rebuilds{r}  {d}draws that rebuilt each section, as a share of draw calls; ns per rebuild where `keys` times it, from 1 in {p} rebuilding draws{r}",
+            p = KEYS_SECTION_SAMPLE_PERIOD,
+            b = s.bold,
+            r = s.reset,
+            d = s.dim,
+        );
+        let any = w.snapshot_rebuild_draws.sum;
+        let _ = writeln!(
+            out,
+            "  {:<16} {any:>9} / {calls:<9} ({:5.1}%)",
+            "any section",
+            pct(any)
+        );
+        for (slot, _, label) in SNAPSHOT_SECTIONS {
+            let rebuilds = w.snapshot_rebuilds_by[slot].sum;
+            let _ = write!(
+                out,
+                "  {label:<16} {rebuilds:>9}   {:<9} ({:5.1}%)",
+                "",
+                pct(rebuilds)
+            );
+            if KEYS_SECTIONS.iter().any(|&(timed, ..)| timed == slot)
+                && let Some(per_rebuild) = w.draw_snapshot_section_per_rebuild(slot)
+            {
+                let ns = cycles_to_ms(per_rebuild) * 1e6;
+                let _ = write!(out, "  {ns:>5.0} ns/rebuild");
+            }
+            let _ = writeln!(out);
+        }
+    }
+
     fn write_alloc_footprint(&self, out: &mut String) {
         use mtld3d_shared::tsc::u64_to_f64_exact;
         let w = self.w;
@@ -5684,6 +6094,35 @@ fn render_kv(w: &PerfWindow, caches: &CacheSizes, window_secs: f64) -> KvLine {
         "draw_snapshot_resid",
         cycles_to_ms(w.draw_snapshot_leftover.max),
     );
+    for (slot, ..) in KEYS_SECTIONS {
+        let stem = section_stem(slot);
+        kv.cycles(
+            format_args!("draw_snapshot_keys_{stem}"),
+            &w.draw_snapshot_section_scaled(slot),
+        );
+    }
+    kv.per_frame_ms(
+        "draw_snapshot_keys_resid",
+        cycles_to_ms(w.draw_snapshot_keys_resid_sum()),
+    );
+    kv.peak_ms(
+        "draw_snapshot_keys_resid",
+        cycles_to_ms(w.draw_snapshot_keys_leftover.max),
+    );
+    kv.total("draw_snapshot_rebuild_draws", w.snapshot_rebuild_draws.sum);
+    kv.total("draw_snapshot_sampled_draws", w.snapshot_sampled_draws.sum);
+    for (slot, ..) in KEYS_SECTIONS {
+        kv.total(
+            format_args!("draw_snapshot_sampled_rebuild_{}", section_stem(slot)),
+            w.snapshot_sampled_rebuilds_by[slot].sum,
+        );
+    }
+    for (slot, stem, _) in SNAPSHOT_SECTIONS {
+        kv.total(
+            format_args!("draw_snapshot_rebuild_{stem}"),
+            w.snapshot_rebuilds_by[slot].sum,
+        );
+    }
     kv.cycles("draw_push_op", &w.draw_push_op);
     for (sub, base) in BIND {
         let i = sub as usize;
@@ -5850,9 +6289,27 @@ fn render_kv(w: &PerfWindow, caches: &CacheSizes, window_secs: f64) -> KvLine {
 #[cfg(all(test, perf_tracking))]
 mod tests;
 
+// Every timed section has a row in the section table, so `section_stem` finds
+// a stem for each of them.
 #[cfg(perf_tracking)]
 const _: () = {
-    assert!(size_of::<FrameCounters>() == 624);
+    let mut timed = 0;
+    while timed < KEYS_SECTIONS.len() {
+        let slot = KEYS_SECTIONS[timed].0;
+        let mut found = false;
+        let mut section = 0;
+        while section < SNAPSHOT_SECTIONS.len() {
+            found |= SNAPSHOT_SECTIONS[section].0 == slot;
+            section += 1;
+        }
+        assert!(found, "every KEYS_SECTIONS slot is in SNAPSHOT_SECTIONS");
+        timed += 1;
+    }
+};
+
+#[cfg(perf_tracking)]
+const _: () = {
+    assert!(size_of::<FrameCounters>() == 928);
     assert!(align_of::<FrameCounters>() == 8);
     assert!(core::mem::offset_of!(FrameCounters, reset_epoch) == 0);
     assert!(core::mem::offset_of!(FrameCounters, inverse_view) == 8);
@@ -5869,42 +6326,48 @@ const _: () = {
     assert!(core::mem::offset_of!(FrameCounters, draw_snapshot_keys_cycles) == 320);
     assert!(core::mem::offset_of!(FrameCounters, draw_snapshot_bumps_cycles) == 328);
     assert!(core::mem::offset_of!(FrameCounters, draw_push_op_cycles) == 336);
-    assert!(core::mem::offset_of!(FrameCounters, reset_epoch_saturated) == 344);
-    assert!(core::mem::offset_of!(FrameCounters, inverse_view_saturated) == 348);
-    assert!(core::mem::offset_of!(FrameCounters, api_call_counts_by_category) == 352);
-    assert!(core::mem::offset_of!(FrameCounters, vb_rename) == 392);
-    assert!(core::mem::offset_of!(FrameCounters, ib_rename) == 396);
-    assert!(core::mem::offset_of!(FrameCounters, vbib_pool_hits) == 400);
-    assert!(core::mem::offset_of!(FrameCounters, vbib_pool_misses) == 404);
-    assert!(core::mem::offset_of!(FrameCounters, vb_discards) == 408);
-    assert!(core::mem::offset_of!(FrameCounters, ib_discards) == 412);
-    assert!(core::mem::offset_of!(FrameCounters, vbib_preserve_cpu) == 416);
-    assert!(core::mem::offset_of!(FrameCounters, vbib_write_in_place_contended) == 420);
-    assert!(core::mem::offset_of!(FrameCounters, retention_cap_drain) == 424);
-    assert!(core::mem::offset_of!(FrameCounters, retention_cap_submit) == 428);
-    assert!(core::mem::offset_of!(FrameCounters, texture_renames) == 432);
-    assert!(core::mem::offset_of!(FrameCounters, texture_discards) == 436);
-    assert!(core::mem::offset_of!(FrameCounters, texture_preserve_cpu) == 440);
-    assert!(core::mem::offset_of!(FrameCounters, texture_write_in_place_contended) == 444);
-    assert!(core::mem::offset_of!(FrameCounters, texture_add_dirty_calls) == 448);
-    assert!(core::mem::offset_of!(FrameCounters, texture_add_dirty_partial) == 452);
-    assert!(core::mem::offset_of!(FrameCounters, texture_add_dirty_area_bp) == 456);
-    assert!(core::mem::offset_of!(FrameCounters, device_sub_calls) == 460);
-    assert!(core::mem::offset_of!(FrameCounters, bind_sub_calls) == 496);
-    assert!(core::mem::offset_of!(FrameCounters, surface_sub_calls) == 520);
-    assert!(core::mem::offset_of!(FrameCounters, keys_gate_calls) == 540);
-    assert!(core::mem::offset_of!(FrameCounters, keys_gate_skips) == 576);
-    assert!(core::mem::offset_of!(FrameCounters, texture_pool_hits) == 612);
-    assert!(core::mem::offset_of!(FrameCounters, texture_pool_misses) == 616);
-    assert!(core::mem::offset_of!(FrameCounters, reserved) == 620);
+    assert!(core::mem::offset_of!(FrameCounters, draw_snapshot_section_cycles) == 344);
+    assert!(core::mem::offset_of!(FrameCounters, draw_snapshot_keys_sampled_cycles) == 488);
+    assert!(core::mem::offset_of!(FrameCounters, reset_epoch_saturated) == 496);
+    assert!(core::mem::offset_of!(FrameCounters, inverse_view_saturated) == 500);
+    assert!(core::mem::offset_of!(FrameCounters, api_call_counts_by_category) == 504);
+    assert!(core::mem::offset_of!(FrameCounters, vb_rename) == 544);
+    assert!(core::mem::offset_of!(FrameCounters, ib_rename) == 548);
+    assert!(core::mem::offset_of!(FrameCounters, vbib_pool_hits) == 552);
+    assert!(core::mem::offset_of!(FrameCounters, vbib_pool_misses) == 556);
+    assert!(core::mem::offset_of!(FrameCounters, vb_discards) == 560);
+    assert!(core::mem::offset_of!(FrameCounters, ib_discards) == 564);
+    assert!(core::mem::offset_of!(FrameCounters, vbib_preserve_cpu) == 568);
+    assert!(core::mem::offset_of!(FrameCounters, vbib_write_in_place_contended) == 572);
+    assert!(core::mem::offset_of!(FrameCounters, retention_cap_drain) == 576);
+    assert!(core::mem::offset_of!(FrameCounters, retention_cap_submit) == 580);
+    assert!(core::mem::offset_of!(FrameCounters, texture_renames) == 584);
+    assert!(core::mem::offset_of!(FrameCounters, texture_discards) == 588);
+    assert!(core::mem::offset_of!(FrameCounters, texture_preserve_cpu) == 592);
+    assert!(core::mem::offset_of!(FrameCounters, texture_write_in_place_contended) == 596);
+    assert!(core::mem::offset_of!(FrameCounters, texture_add_dirty_calls) == 600);
+    assert!(core::mem::offset_of!(FrameCounters, texture_add_dirty_partial) == 604);
+    assert!(core::mem::offset_of!(FrameCounters, texture_add_dirty_area_bp) == 608);
+    assert!(core::mem::offset_of!(FrameCounters, device_sub_calls) == 612);
+    assert!(core::mem::offset_of!(FrameCounters, bind_sub_calls) == 648);
+    assert!(core::mem::offset_of!(FrameCounters, surface_sub_calls) == 672);
+    assert!(core::mem::offset_of!(FrameCounters, keys_gate_calls) == 692);
+    assert!(core::mem::offset_of!(FrameCounters, keys_gate_skips) == 728);
+    assert!(core::mem::offset_of!(FrameCounters, snapshot_rebuilds) == 764);
+    assert!(core::mem::offset_of!(FrameCounters, snapshot_sampled_rebuilds) == 836);
+    assert!(core::mem::offset_of!(FrameCounters, snapshot_rebuild_draws) == 908);
+    assert!(core::mem::offset_of!(FrameCounters, snapshot_sampled_draws) == 912);
+    assert!(core::mem::offset_of!(FrameCounters, texture_pool_hits) == 916);
+    assert!(core::mem::offset_of!(FrameCounters, texture_pool_misses) == 920);
+    assert!(core::mem::offset_of!(FrameCounters, reserved) == 924);
     assert!(size_of::<FrameTiming>() == 32);
     assert!(align_of::<FrameTiming>() == 8);
     assert!(core::mem::offset_of!(FrameTiming, present_block_cycles) == 0);
     assert!(core::mem::offset_of!(FrameTiming, frame_total_cycles) == 8);
     assert!(core::mem::offset_of!(FrameTiming, op_vec_capacity_bytes) == 16);
     assert!(core::mem::offset_of!(FrameTiming, op_vec_realloc_bytes) == 24);
-    assert!(size_of::<FramePerfPayload>() == 656);
+    assert!(size_of::<FramePerfPayload>() == 960);
     assert!(align_of::<FramePerfPayload>() == 8);
     assert!(core::mem::offset_of!(FramePerfPayload, counters) == 0);
-    assert!(core::mem::offset_of!(FramePerfPayload, timing) == 624);
+    assert!(core::mem::offset_of!(FramePerfPayload, timing) == 928);
 };

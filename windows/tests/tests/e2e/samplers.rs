@@ -874,6 +874,108 @@ fn set_lod_on_a_bound_texture_reaches_the_next_draw_of_the_frame() {
     assert_set_lod_reaches_the_next_draw(&h, &left, &right, |lod| tex.set_lod(lod), "mip off");
 }
 
+/// Sampler writes of the stored value between draws leave every draw of the frame right.
+///
+/// A write of the value a stage already holds marks nothing. A new value
+/// still reaches the next draw of the same frame, and a texture write reaches
+/// the draw after a same-value sampler write, since the texture marks the
+/// stage bindings itself.
+#[test]
+fn same_value_sampler_writes_between_draws_leave_every_draw_right() {
+    use mtld3d_types::D3DPOOL_MANAGED;
+
+    const GREY: u32 = 0xFF80_8080;
+    let h = Harness::new();
+    let tex = mip_tinted_texture_in(&h, D3DPOOL_MANAGED);
+    arm_mip_tinted(&h, &tex);
+    let (left, right) = (texel_to_pixel_quad(), texel_to_pixel_quad_at(SET_LOD_RIGHT));
+    let centre = MIP_TEX_DIM / 2;
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 0), 0);
+
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left), 0);
+        for level in [0, 2, 2] {
+            assert_eq!(
+                d.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level),
+                0,
+                "SetSamplerState(MAXMIPLEVEL, {level})"
+            );
+        }
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &right), 0);
+    });
+    assert_eq!(
+        h.read_pixel(centre, centre),
+        MIP_TINTS[0],
+        "the draw before the new value samples the base level"
+    );
+    assert_eq!(
+        h.read_pixel(SET_LOD_RIGHT + centre, centre),
+        MIP_TINTS[2],
+        "the draw after the new value samples level 2"
+    );
+
+    let side = usize::try_from(MIP_TEX_DIM >> 2).expect("mip dim fits usize");
+    tex.lock_rect(2, 0).write_u32(&vec![GREY; side * side]);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 2), 0);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left), 0);
+    });
+    assert_eq!(
+        h.read_pixel(centre, centre),
+        GREY,
+        "a texture write reaches the draw after a same-value sampler write"
+    );
+}
+
+/// A same-value sampler write re-attaches a bound texture that another device took over.
+///
+/// The first device binds a managed texture and draws. Inside that frame a
+/// second device binds the same texture and draws, which moves the texture
+/// onto the second device, and the base level is then rewritten. The first
+/// device's encoder still holds the texture it uploaded before the move, so
+/// only its stage walk, which brings the texture back and uploads the new
+/// level, lets its next draw see the write. A sampler write of the stored
+/// value must leave that walk armed; the draw before it is not checked, since
+/// an upload scheduled in a frame runs at its head.
+#[test]
+fn same_value_sampler_write_keeps_a_texture_another_device_took_over() {
+    use mtld3d_types::D3DPOOL_MANAGED;
+
+    const GREY: u32 = 0xFF80_8080;
+    let first = Harness::new();
+    let second = Harness::new();
+    let tex = mip_tinted_texture_in(&first, D3DPOOL_MANAGED);
+    arm_mip_tinted(&first, &tex);
+    arm_mip_tinted(&second, &tex);
+    let (left, right) = (texel_to_pixel_quad(), texel_to_pixel_quad_at(SET_LOD_RIGHT));
+    let centre = MIP_TEX_DIM / 2;
+    let side = usize::try_from(MIP_TEX_DIM).expect("mip dim fits usize");
+
+    first.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left), 0);
+        second.render_once(BLACK, |s| {
+            assert_eq!(s.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left), 0);
+        });
+        tex.lock_rect(0, 0).write_u32(&vec![GREY; side * side]);
+        assert_eq!(
+            d.set_sampler_state(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+            0,
+            "SetSamplerState of the stored MAGFILTER"
+        );
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &right), 0);
+    });
+    assert_eq!(
+        second.read_pixel(centre, centre),
+        MIP_TINTS[0],
+        "the second device samples the texture it took over"
+    );
+    assert_eq!(
+        first.read_pixel(SET_LOD_RIGHT + centre, centre),
+        GREY,
+        "the first device's draw after the same-value sampler write sees the write"
+    );
+}
+
 #[test]
 fn set_lod_on_a_bound_volume_texture_reaches_the_next_draw_of_the_frame() {
     use mtld3d_types::{D3DFVF_TEXTUREFORMAT3, D3DPOOL_MANAGED};

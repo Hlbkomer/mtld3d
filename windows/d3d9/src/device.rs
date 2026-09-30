@@ -49,6 +49,7 @@ use mtld3d_core::{
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
     render_scale::TargetExtent,
     render_state::{RsClass, rs_classify},
+    snapshot::SnapshotSection,
     streams::validate_stream_freq,
     texture_flags::TextureFlags,
     upload_redirty::RedirtyQueue,
@@ -392,6 +393,12 @@ pub struct DeviceInner {
     /// only its own `AddRef`s. Released when `DeviceInner` drops (`HashMap`
     /// value `Drop` runs `K::on_drop`).
     fvf_decl_cache: rustc_hash::FxHashMap<u32, CachedComPtr<Direct3DVertexDeclaration9, Bound>>,
+    /// The FVF `bind_fvf_decl` last bound, with its implicit declaration from `fvf_decl_cache`.
+    ///
+    /// Only compared against the bound pointer, never dereferenced. The cache
+    /// holds every entry until the device drops, so no other declaration can
+    /// take this address while the pair names it.
+    last_fvf_bind: (u32, *mut Direct3DVertexDeclaration9),
     /// `IDirect3D9`* that created this device.
     ///
     /// Kept so `GetDirect3D` can hand back the parent interface (with
@@ -835,65 +842,77 @@ bitflags::bitflags! {
     ///
     /// One bit per cached piece in `FrameEncoder::current_snapshot`. See
     /// `SnapshotCache` doc on `DeviceInner::snapshot_dirty` for lifecycle.
+    /// Each bit is its [`SnapshotSection`]'s, so the perf summary's
+    /// per-section rebuild counters read the mask directly.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct SnapshotDirty: u32 {
         /// `RenderStateSnapshot` (~25 RS slots).
-        const RS          = 1 << 0;
+        const RS          = SnapshotSection::Rs.bit();
         /// `[Option<StageBinding>; STAGE_COUNT]` — bound textures and per-stage sampler state.
         ///
         /// `bound_texture_mask` rebuild is folded into this branch (see
         /// `emit_snapshot_deltas`).
-        const STAGES      = 1 << 1;
+        const STAGES      = SnapshotSection::Stages.bit();
         /// `has_depth` + `has_stencil` on the current render target.
-        const RT_DS       = 1 << 3;
+        const RT_DS       = SnapshotSection::RtDs.bit();
         /// Vertex attribute layout (`AttrSnapshot`: attrs slice, stride, vdecl hash).
-        const VDECL       = 1 << 4;
+        const VDECL       = SnapshotSection::Vdecl.bit();
         /// Pipeline variant key.
-        const VARIANT     = 1 << 5;
+        const VARIANT     = SnapshotSection::Variant.bit();
         /// VS source (FF key or programmable `vs_id`).
-        const VS_SOURCE   = 1 << 6;
+        const VS_SOURCE   = SnapshotSection::VsSource.bit();
         /// PS source.
-        const PS_SOURCE   = 1 << 7;
+        const PS_SOURCE   = SnapshotSection::PsSource.bit();
         /// VS constants slot.
-        const VS_CONST    = 1 << 8;
+        const VS_CONST    = SnapshotSection::VsConst.bit();
         /// PS constants slot.
-        const PS_CONST    = 1 << 9;
+        const PS_CONST    = SnapshotSection::PsConst.bit();
         /// Alpha-ref bytes (PS slot 14).
-        const ALPHA_REF   = 1 << 10;
+        const ALPHA_REF   = SnapshotSection::AlphaRef.bit();
         /// Fog-color bytes (PS slot 13).
-        const FOG_COLOR   = 1 << 11;
+        const FOG_COLOR   = SnapshotSection::FogColor.bit();
         /// Bump-environment matrix bytes (PS slot 12).
         ///
         /// Per-stage `D3DTSS_BUMPENVMAT*` + luminance, consumed by SM1
         /// `texbem`/`texbeml`/`bem`.
-        const BUMP_ENV    = 1 << 12;
+        const BUMP_ENV    = SnapshotSection::BumpEnv.bit();
         /// VS integer-constant file bytes (vertex slot 14).
         ///
         /// `vs_constants_i`, consumed by a VS reading a dynamic (non-`defi`)
         /// integer constant.
-        const VS_CONST_I  = 1 << 13;
+        const VS_CONST_I  = SnapshotSection::VsConstI.bit();
         /// Per-draw `VsDraw` uniform bytes (point size state).
         ///
         /// `mtld3d_core::vs_draw::VsDrawState::build_bytes` over the point render
         /// states, bound for every draw.
-        const VS_DRAW     = 1 << 14;
+        const VS_DRAW     = SnapshotSection::VsDraw.bit();
         /// VS boolean-constant bitmask (vertex slot 26).
         ///
         /// `vs_constants_b`, consumed by a VS reading a dynamic (non-`defb`)
         /// boolean constant.
-        const VS_CONST_B  = 1 << 15;
+        const VS_CONST_B  = SnapshotSection::VsConstB.bit();
         /// PS integer-constant file bytes (fragment slot 11).
         ///
         /// `ps_constants_i`, consumed by a PS reading a dynamic (non-`defi`)
         /// integer constant.
-        const PS_CONST_I  = 1 << 16;
+        const PS_CONST_I  = SnapshotSection::PsConstI.bit();
         /// PS boolean-constant bitmask (fragment slot 10).
         ///
         /// `ps_constants_b`, consumed by a PS reading a dynamic (non-`defb`)
         /// boolean constant.
-        const PS_CONST_B  = 1 << 17;
+        const PS_CONST_B  = SnapshotSection::PsConstB.bit();
     }
 }
+
+// The flags take their bits from `SnapshotSection`; pin a few so a renumbered
+// section cannot move a flag unnoticed.
+const _: () = {
+    assert!(SnapshotDirty::RS.bits() == 1 << 0);
+    assert!(SnapshotDirty::STAGES.bits() == 1 << 1);
+    assert!(SnapshotDirty::RT_DS.bits() == 1 << 3);
+    assert!(SnapshotDirty::VS_SOURCE.bits() == 1 << 6);
+    assert!(SnapshotDirty::PS_CONST_B.bits() == 1 << 17);
+};
 
 impl DeviceInner {
     /// Read the implicit front buffer into a validated caller-owned surface.
@@ -1170,13 +1189,46 @@ impl DeviceInner {
     /// declaration (the most-recent of `SetFVF` / `SetVertexDeclaration`
     /// wins). `fvf == 0` is a no-op on the binding, matching the driver.
     /// Returns whether the bound declaration changed (callers gate snapshot
-    /// dirtying on this).
+    /// dirtying on this). A call that would change nothing returns before the
+    /// cache lookup (see [`Self::fvf_bind_is_redundant`]).
+    #[inline]
     pub fn bind_fvf_decl(&mut self, fvf: u32) -> bool {
-        if fvf == 0 {
+        if fvf == 0 || self.fvf_bind_is_redundant(fvf) {
             return false;
         }
+        self.bind_fvf_decl_uncached(fvf)
+    }
+
+    /// Whether binding `fvf` would leave the FVF field and the bound declaration as they are.
+    ///
+    /// True exactly when the FVF field already reads `fvf` and the bound
+    /// declaration is `fvf`'s implicit one. The field alone does not say
+    /// that: a state-block apply writes it without binding a declaration
+    /// and restores a declaration without writing it, so the bound pointer is
+    /// compared too, against the one `bind_fvf_decl` last bound for
+    /// `last_fvf_bind`'s FVF. Each FVF has one cached declaration, so a match
+    /// on both halves is the pair the cache lookup would produce, and every
+    /// dirty mark the caller gates on a change would be skipped anyway.
+    ///
+    /// The pointer is compared first: a caller that alternates `SetFVF` with
+    /// `SetVertexDeclaration` leaves the FVF field matching and fails only
+    /// there, so that order sends it to the lookup after one test.
+    #[inline]
+    fn fvf_bind_is_redundant(&self, fvf: u32) -> bool {
+        let (bound_fvf, bound_decl) = self.last_fvf_bind;
+        self.vertex_decl.raw() == bound_decl && bound_fvf == fvf && self.fvf == fvf
+    }
+
+    /// The [`Self::bind_fvf_decl`] path that looks the declaration up and binds it.
+    #[inline(never)]
+    fn bind_fvf_decl_uncached(&mut self, fvf: u32) -> bool {
         let decl = self.get_or_create_fvf_decl(fvf);
         self.fvf = fvf;
+        self.last_fvf_bind = if decl.is_null() {
+            (0, core::ptr::null_mut())
+        } else {
+            (fvf, decl)
+        };
         self.replace_vertex_decl(decl)
     }
 
@@ -1332,6 +1384,46 @@ impl DeviceInner {
             result.remove(SnapshotDirty::PS_SOURCE | SnapshotDirty::PS_CONST);
         }
         result
+    }
+
+    /// Dirty bits for a transform or light write to the fixed-function state.
+    ///
+    /// The write always changes the FF VS constants. It changes the FF VS
+    /// source only when `source_moved`: the thunk compares
+    /// [`FfState::vs_source_transform_inputs`] or
+    /// [`FfState::vs_source_light_inputs`] across the write, since a matrix or
+    /// a light's parameters alone never reach the key, while palette growth, a
+    /// light enable or a light type change can. The result then goes through
+    /// [`Self::ff_aware_mask`].
+    fn ff_vs_write_mask(&self, source_moved: bool) -> SnapshotDirty {
+        let mut mask = SnapshotDirty::VS_CONST;
+        if source_moved {
+            mask |= SnapshotDirty::VS_SOURCE;
+        }
+        self.ff_aware_mask(mask)
+    }
+
+    /// Dirty bits outside the FF VS source and constants that a write to transform `state` needs.
+    ///
+    /// `SetTransform` and `MultiplyTransform` both add these to
+    /// [`Self::ff_vs_write_mask`], since each rewrites the matrix in place.
+    /// Active table fog keys its Z-versus-W source on the projection matrix's
+    /// 4th column (`VariantKey::fog_source_w`), so a PROJECTION write rebuilds
+    /// the variant; the gate on live table fog keeps vertex-fog-only games
+    /// from churning the variant on every per-frame projection update. The
+    /// fixed-function clip planes walk back from eye space through the
+    /// inverse view the `VsDraw` uniform carries, so a VIEW write rebuilds it.
+    fn transform_write_side_dirty(&self, state: u32) -> SnapshotDirty {
+        match state {
+            mtld3d_types::D3DTS_PROJECTION
+                if self.render_states[D3DRS_FOGENABLE as usize] != 0
+                    && matches!(self.render_states[D3DRS_FOGTABLEMODE as usize], 1..=3) =>
+            {
+                SnapshotDirty::VARIANT | SnapshotDirty::PS_SOURCE
+            }
+            mtld3d_types::D3DTS_VIEW => SnapshotDirty::VS_DRAW,
+            _ => SnapshotDirty::empty(),
+        }
     }
 
     /// Start a new recording.
@@ -2207,13 +2299,32 @@ impl DeviceInner {
     /// Callers gate `mark_snapshot_dirty` on this. POINTSIZE also compares
     /// its numeric value and coverage latch: a state-block restore can leave
     /// either different from the component a same-raw write would select.
+    ///
+    /// A write of the value the slot already holds returns here, before the
+    /// call into [`Self::write_render_state`]. The silent-write audit has
+    /// nothing to say about it: a stored value is one the device starts or
+    /// resets with, all of them defaults or consumed, or it came through the
+    /// audit, which latched the slot if the value is not consumed. Only the
+    /// state trace lists such a write, so the early return is taken while
+    /// the trace is off.
+    #[inline]
     pub fn set_render_state(&mut self, index: usize, value: u32) -> bool {
+        if index != D3DRS_POINTSIZE as usize
+            && self.render_states[index] == value
+            && !mtld3d_core::state_trace::enabled()
+        {
+            return false;
+        }
+        self.write_render_state(index, value)
+    }
+
+    /// The [`Self::set_render_state`] path that audits the write and stores it.
+    ///
+    /// Out of line so the setter's callers inline only the same-value test.
+    #[inline(never)]
+    fn write_render_state(&mut self, index: usize, value: u32) -> bool {
         if index == D3DRS_POINTSIZE as usize {
-            return self.set_point_size_state(
-                value,
-                mtld3d_core::multisample::numeric_point_size(value),
-                mtld3d_core::multisample::a2m_control(value),
-            );
+            return self.set_point_size_render_state(value);
         }
         self.warn_rs_non_default_once(index, value);
         let prev = self.render_states[index];
@@ -2265,6 +2376,18 @@ impl DeviceInner {
         changed
     }
 
+    /// The POINTSIZE arm of [`Self::write_render_state`], which also decodes the A2M token.
+    ///
+    /// Out of line so the render-state write stays small.
+    #[inline(never)]
+    fn set_point_size_render_state(&mut self, value: u32) -> bool {
+        self.set_point_size_state(
+            value,
+            mtld3d_core::multisample::numeric_point_size(value),
+            mtld3d_core::multisample::a2m_control(value),
+        )
+    }
+
     pub const fn point_size(&self) -> u32 {
         self.point_size
     }
@@ -2307,13 +2430,19 @@ impl DeviceInner {
         self.rs_warn_fired[index / 64] |= 1u64 << (index % 64);
     }
 
+    /// The silent-write audit of one render-state write.
+    ///
+    /// The tests stay inline, so the setter can inline this; the latch mark
+    /// and every log line live in cold functions.
+    #[inline]
     fn warn_rs_non_default_once(&mut self, index: usize, value: u32) {
         static RS_DEFAULTS: [u32; RENDER_STATE_COUNT] = render_state_defaults();
 
         if index >= RENDER_STATE_COUNT {
             return;
         }
-        if value == RS_DEFAULTS[index] {
+        let default = RS_DEFAULTS[index];
+        if value == default {
             if mtld3d_core::state_trace::enabled() {
                 Self::trace_default_rs(index, value);
             }
@@ -2322,18 +2451,14 @@ impl DeviceInner {
         if self.rs_warn_fired(index) {
             return;
         }
-        let class = rs_classify(
-            u32::try_from(index).expect("D3DRS index fits u32 by RENDER_STATE_COUNT bound"),
-            value,
-        );
-        if matches!(class, RsClass::Consumed) {
+        let state = u32::try_from(index).expect("D3DRS index fits u32 by RENDER_STATE_COUNT bound");
+        if matches!(rs_classify(state, value), RsClass::Consumed) {
             if mtld3d_core::state_trace::enabled() {
-                Self::trace_consumed_rs(index, value, RS_DEFAULTS[index]);
+                Self::trace_consumed_rs(index, value, default);
             }
             return;
         }
-        self.mark_rs_warn(index);
-        Self::log_unconsumed_rs(index, value, RS_DEFAULTS[index], &class);
+        self.log_unconsumed_rs_once(index, value, default);
     }
 
     /// Keep trace formatting off the ordinary render-state setter stack.
@@ -2356,11 +2481,13 @@ impl DeviceInner {
         );
     }
 
-    /// Format a diagnostic only after its once-per-slot latch is marked.
+    /// Mark the once-per-slot latch of an unconsumed write, then format its diagnostic.
     #[cold]
     #[inline(never)]
-    fn log_unconsumed_rs(index: usize, value: u32, default: u32, class: &RsClass) {
-        match class {
+    fn log_unconsumed_rs_once(&mut self, index: usize, value: u32, default: u32) {
+        self.mark_rs_warn(index);
+        let state = u32::try_from(index).expect("D3DRS index fits u32 by RENDER_STATE_COUNT bound");
+        match rs_classify(state, value) {
             RsClass::Consumed => {} // unreachable given early-return above
             RsClass::Obsolete(reason) => {
                 info!(
@@ -2925,6 +3052,7 @@ impl Direct3DDevice9 {
             fvf: 0,
             vertex_decl: CachedComPtr::null(),
             fvf_decl_cache: rustc_hash::FxHashMap::default(),
+            last_fvf_bind: (0, core::ptr::null_mut()),
             direct3d: info.direct3d,
             device_wrapper: 0,
             creation_adapter: info.creation_adapter,
@@ -3501,6 +3629,33 @@ fn draw_snapshot_keys_ptr(perf_ptr: *mut ApiPerfState) -> *mut u64 {
     }
     // SAFETY: see `draw_snapshot_ptr`.
     unsafe { (*perf_ptr).draw_snapshot_keys_cycles_ptr() }
+}
+
+/// Pointer the `CycleAddTimer` writes into for one section's rebuild block in the snapshot.
+///
+/// A child of `draw_snapshot_keys_ptr` for the six sections inside the
+/// `keys` scope, started only inside the section's dirty branch. Same
+/// null-guard as `draw_snapshot_ptr`.
+#[inline]
+fn draw_snapshot_section_ptr(perf_ptr: *mut ApiPerfState, section: SnapshotSection) -> *mut u64 {
+    if perf_ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: see `draw_snapshot_ptr`.
+    unsafe { (*perf_ptr).draw_snapshot_section_cycles_ptr(section) }
+}
+
+/// Pointer the `CycleAddTimer` for the `keys` scope of a sampled draw writes into.
+///
+/// Null on an unsampled draw (the caller passes a null `perf_ptr`), so the
+/// timer reads no clock there. Same null-guard as `draw_snapshot_ptr`.
+#[inline]
+fn draw_snapshot_keys_sampled_ptr(perf_ptr: *mut ApiPerfState) -> *mut u64 {
+    if perf_ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: see `draw_snapshot_ptr`.
+    unsafe { (*perf_ptr).draw_snapshot_keys_sampled_cycles_ptr() }
 }
 
 /// Pointer the `CycleAddTimer` writes into for the post-consts scratch bumps.
@@ -9086,23 +9241,10 @@ extern "system" fn device_set_transform(
         return D3D_OK;
     }
     // Unknown D3DTS_* indices (vertex blending etc.) are silently accepted.
+    let inputs = dev.ff_state().vs_source_transform_inputs();
     dev.ff_state_mut().set_transform(state, &m);
-    let mut mask = dev.ff_aware_mask(SnapshotDirty::VS_SOURCE | SnapshotDirty::VS_CONST);
-    // Active table fog keys its Z-vs-W source on the projection matrix's
-    // 4th column (`VariantKey::fog_source_w`), so a PROJECTION write must
-    // rebuild the variant. Gated on live table fog so vertex-fog-only games
-    // don't churn the variant on every per-frame projection update.
-    if state == mtld3d_types::D3DTS_PROJECTION
-        && dev.render_states()[D3DRS_FOGENABLE as usize] != 0
-        && matches!(dev.render_states()[D3DRS_FOGTABLEMODE as usize], 1..=3)
-    {
-        mask |= SnapshotDirty::VARIANT | SnapshotDirty::PS_SOURCE;
-    }
-    // The fixed-function clip planes walk back from eye space through the
-    // inverse view the VsDraw uniform carries.
-    if state == mtld3d_types::D3DTS_VIEW {
-        mask |= SnapshotDirty::VS_DRAW;
-    }
+    let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_transform_inputs() != inputs)
+        | dev.transform_write_side_dirty(state);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
@@ -9153,8 +9295,10 @@ extern "system" fn device_multiply_transform(
     // EndStateBlock returns the multiplied matrix, and a later Capture/Apply
     // does not restore it). So
     // always apply to live FF state, regardless of recording.
+    let inputs = dev.ff_state().vs_source_transform_inputs();
     dev.ff_state_mut().multiply_transform(state, &rhs);
-    let mask = dev.ff_aware_mask(SnapshotDirty::VS_SOURCE | SnapshotDirty::VS_CONST);
+    let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_transform_inputs() != inputs)
+        | dev.transform_write_side_dirty(state);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
@@ -9217,8 +9361,9 @@ extern "system" fn device_set_material(this: *mut c_void, material: *const c_voi
         rec.record(StateOp::Material(m));
         return D3D_OK;
     }
+    // The material feeds the constant sections alone, never the FF VS key.
     dev.ff_state_mut().set_material(&m);
-    let mask = dev.ff_aware_mask(SnapshotDirty::VS_SOURCE | SnapshotDirty::VS_CONST);
+    let mask = dev.ff_aware_mask(SnapshotDirty::VS_CONST);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
@@ -9255,8 +9400,9 @@ extern "system" fn device_set_light(this: *mut c_void, index: u32, light: *const
         rec.record(StateOp::Light { index, light: l });
         return D3D_OK;
     }
+    let inputs = dev.ff_state().vs_source_light_inputs();
     dev.ff_state_mut().set_light_at(index, &l);
-    let mask = dev.ff_aware_mask(SnapshotDirty::VS_SOURCE | SnapshotDirty::VS_CONST);
+    let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_light_inputs() != inputs);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
@@ -9298,8 +9444,9 @@ extern "system" fn device_light_enable(this: *mut c_void, index: u32, enable: i3
         rec.record(StateOp::LightEnable { index, enable: on });
         return D3D_OK;
     }
+    let inputs = dev.ff_state().vs_source_light_inputs();
     dev.ff_state_mut().set_light_enabled_at(index, on);
-    let mask = dev.ff_aware_mask(SnapshotDirty::VS_SOURCE | SnapshotDirty::VS_CONST);
+    let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_light_inputs() != inputs);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
@@ -9618,10 +9765,14 @@ extern "system" fn device_set_texture(this: *mut c_void, stage: u32, texture: *m
         dev.set_vertex_texture_slot(slot, new_tex);
         return D3D_OK;
     }
+    if rebind_is_redundant(dev, stage as usize, new_tex) {
+        dev.perf_mut().record_keys_gate(KeysGate::SetTexture, true);
+        return D3D_OK;
+    }
     let delta = dev
         .stage_bindings_mut()
         .replace_texture(stage as usize, new_tex);
-    // STAGES always: the encoder binds the new handle and
+    // STAGES on every swap: the encoder binds the new handle and
     // `snapshot_stage_bindings` re-runs flush_dirty_mips/rehydrate and
     // refreshes `cached_bound_texture_mask`. The FF VS/PS keys depend
     // only on the 8-bit occupancy mask (stages 0..7); the variant only
@@ -9651,6 +9802,32 @@ extern "system" fn device_set_texture(this: *mut c_void, stage: u32, texture: *m
     dev.perf_mut()
         .record_keys_gate(KeysGate::SetTexture, !ffkey_rebuilt);
     0 // S_OK
+}
+
+/// Whether binding `tex` at pixel `stage` leaves every input of the stage walk as it is.
+///
+/// True when the stage already holds `tex` and `tex` is null or attached to
+/// `dev`. The slot, its reference and the cached kind and Fetch4 masks are
+/// functions of the pointer alone, so rewriting them changes nothing. What the
+/// walk reads through the texture (its contents, pending uploads, LOD and
+/// residency) is marked dirty on the texture's own device by whichever call
+/// changes it, which is `dev` once the texture is attached here. A texture
+/// attached to another device comes back through a rehydrate on this device,
+/// which the stage walk performs for every bound stage, so that rebind keeps
+/// its mark.
+fn rebind_is_redundant(
+    dev: &DeviceInner,
+    stage: usize,
+    tex: *mut crate::texture::Direct3DTexture9,
+) -> bool {
+    if dev.stage_bindings().texture(stage) != tex {
+        return false;
+    }
+    // SAFETY: `tex` is the pointer the stage already holds, so it is null or
+    // kept alive by the stage's reference.
+    unsafe { tex.as_ref() }.is_none_or(|bound| {
+        bound.inner().device_inner() == std::ptr::from_ref::<DeviceInner>(dev) as u64
+    })
 }
 
 extern "system" fn device_get_texture_stage_state(
@@ -9802,14 +9979,23 @@ extern "system" fn device_set_sampler_state(
         dev.set_vertex_sampler_slot_state(slot, type_ as usize, value);
         return D3D_OK;
     }
+    let stage = sampler as usize;
     let old_fetch4 = dev.stage_bindings().fetch4().masks();
-    dev.stage_bindings_mut()
-        .set_sampler_state(sampler as usize, type_ as usize, value);
-    if old_fetch4 != dev.stage_bindings().fetch4().masks() {
-        dev.mark_snapshot_dirty(SnapshotDirty::VARIANT);
+    if dev
+        .stage_bindings_mut()
+        .set_sampler_state(stage, type_ as usize, value)
+    {
+        if old_fetch4 != dev.stage_bindings().fetch4().masks() {
+            dev.mark_snapshot_dirty(SnapshotDirty::VARIANT);
+        }
+        // Sampler state lives inside StageBinding only.
+        dev.mark_snapshot_dirty(SnapshotDirty::STAGES);
+    } else if !rebind_is_redundant(dev, stage, dev.stage_bindings().texture(stage)) {
+        // A write of the stored value changes no input of the stage walk, as
+        // a rebind of the bound texture changes none, unless that texture is
+        // attached to another device and needs the walk to come back.
+        dev.mark_snapshot_dirty(SnapshotDirty::STAGES);
     }
-    // Sampler state lives inside StageBinding only.
-    dev.mark_snapshot_dirty(SnapshotDirty::STAGES);
     0 // S_OK
 }
 
@@ -10484,8 +10670,16 @@ extern "system" fn device_draw_indexed_primitive(
 /// A buffer drawn while locked never reached `Unlock`'s upload, so its latest
 /// CPU writes are flushed here. The lock stays open and `dirty` stays set, so
 /// `Unlock` still flushes afterwards.
+///
+/// Only the streams the bound declaration reads are visited, the same set
+/// [`snapshot_bound_streams`] captures: a buffer bound to a stream the draw
+/// does not read is not read by it either.
+#[inline]
 fn flush_mapped_bound_buffers(dev: &mut DeviceInner) {
-    for stream in 0..mtld3d_types::MAX_STREAMS as usize {
+    let mut mask = declared_stream_mask(dev);
+    while mask != 0 {
+        let stream = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
         let vb = dev.bound_buffers().stream_vertex_buffer(stream);
         if !vb.is_null() {
             // SAFETY: a bound vertex buffer is a live wrapper while bound.
@@ -10519,22 +10713,26 @@ fn snapshot_bound_vertex_source(dev: &DeviceInner) -> Option<BoundVertices> {
     })
 }
 
+/// The vertex streams a draw reads: the bound declaration's, or stream 0 alone with none bound.
+fn declared_stream_mask(dev: &DeviceInner) -> u16 {
+    let decl_ptr = dev.vertex_decl();
+    if decl_ptr.is_null() {
+        1
+    } else {
+        // SAFETY: non-null; the device slot's refcount keeps the declaration
+        // alive while bound.
+        unsafe { &*decl_ptr }.inner().stream_mask()
+    }
+}
+
 /// Snapshot the first bound declared stream and any further ones, as for a bound draw.
 ///
 /// Generic over the first stream's form, so each caller converts it where it is captured.
 fn snapshot_bound_streams<First: From<StreamBinding>>(
     dev: &DeviceInner,
 ) -> Option<(First, mtld3d_core::draw_data::ExtraStreams)> {
-    let decl_ptr = dev.vertex_decl();
-    let decl_mask = if decl_ptr.is_null() {
-        1
-    } else {
-        // SAFETY: non-null; the device slot's refcount keeps the declaration
-        // alive while bound.
-        unsafe { &*decl_ptr }.inner().stream_mask()
-    };
     let bound = dev.bound_buffers();
-    let mut mask = decl_mask;
+    let mut mask = declared_stream_mask(dev);
     if mask == 0 {
         return None;
     }
@@ -10815,6 +11013,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         }
         return;
     }
+    let sampled = obj.inner().perf_mut().record_snapshot_rebuild(dirty.bits());
 
     let stages_ptr = draw_snapshot_stages_ptr(DeviceInner::perf_ptr_of(obj.inner));
     let stages_timer = CycleAddTimer::start(stages_ptr);
@@ -10851,15 +11050,30 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     // stages walk and the consts work; instrumenting them as one bucket
     // attributes per-draw cost that would otherwise fall into the "other"
     // residual. Dropped just before `consts_timer`
-    // starts so the buckets don't double-count.
-    let keys_timer =
-        CycleAddTimer::start(draw_snapshot_keys_ptr(DeviceInner::perf_ptr_of(obj.inner)));
+    // starts so the buckets don't double-count. Each section's own timer
+    // runs inside its dirty branch, a child of `keys_timer`, and only on a
+    // sampled draw: on the others its target is null and it reads no clock.
+    // The sampled draws also time the whole scope into a slot of their own,
+    // so the part of `keys` outside the sections is taken on the same draws
+    // as the sections, with the same timer cost in both.
+    let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
+    let section_perf_ptr = if sampled {
+        perf_ptr
+    } else {
+        core::ptr::null_mut()
+    };
+    let keys_timer = CycleAddTimer::start(draw_snapshot_keys_ptr(perf_ptr));
+    let keys_sampled_timer = CycleAddTimer::start(draw_snapshot_keys_sampled_ptr(section_perf_ptr));
     let dev = obj.inner();
 
     // VDECL FIRST — its rebuild updates `dev.cached_ff_vs_layout`,
     // which conflicts with the long-lived `dev.render_states()` borrow
     // taken below.
     let vdecl_value = if dirty.contains(SnapshotDirty::VDECL) {
+        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
+            section_perf_ptr,
+            SnapshotSection::Vdecl,
+        ));
         let bound_vertex_shader = dev.shader_bindings().vertex_shader();
         let fvf = dev.fvf;
         let decl_ptr = dev.vertex_decl();
@@ -10925,6 +11139,10 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     let render_state_value = if dirty.contains(SnapshotDirty::RS) {
         use mtld3d_core::pipeline_state::{PipelineRsBits, PipelineRsFlags};
 
+        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
+            section_perf_ptr,
+            SnapshotSection::Rs,
+        ));
         // `SetRenderState` stores whatever DWORD the game passed, so an
         // enum state is narrowed through `render_state::enum_value`: the
         // byte when the value is inside that state's enum space, the D3D9
@@ -11024,6 +11242,10 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
 
     // RT_DS: depth/stencil presence.
     let depth_stencil_value = if dirty.contains(SnapshotDirty::RT_DS) {
+        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
+            section_perf_ptr,
+            SnapshotSection::RtDs,
+        ));
         let bound_ds = dev.bound_rt().depth_stencil();
         let (has_depth, has_stencil) = if !bound_ds.is_null() {
             // SAFETY: non-null check passed; refcount holds it live.
@@ -11048,6 +11270,10 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     // VARIANT: depends on RS + ff_vs_layout.has_rhw + depth_sampler_mask
     // (current live stage bindings).
     let variant_value = if dirty.contains(SnapshotDirty::VARIANT) {
+        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
+            section_perf_ptr,
+            SnapshotSection::Variant,
+        ));
         let mut variant = dev.ff_state().variant_key(
             rs,
             dev.cached_ff_vs_layout.has_rhw(),
@@ -11085,6 +11311,10 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     // even when a VS is still bound. The PS side is NOT bypassed — a bound PS
     // still runs.
     let vs_value = if dirty.contains(SnapshotDirty::VS_SOURCE) {
+        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
+            section_perf_ptr,
+            SnapshotSection::VsSource,
+        ));
         if bound_vertex_shader.is_null() || dev.cached_ff_vs_layout.has_rhw() {
             let key = dev
                 .ff_state()
@@ -11137,6 +11367,10 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
 
     // PS_SOURCE.
     let ps_value = if dirty.contains(SnapshotDirty::PS_SOURCE) {
+        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
+            section_perf_ptr,
+            SnapshotSection::PsSource,
+        ));
         if bound_pixel_shader.is_null() {
             let key = dev.ff_state().build_ps_key(rs, bound_mask);
             let sampled_stage_mask = key.sampled_stage_mask();
@@ -11182,6 +11416,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         None
     };
 
+    drop(keys_sampled_timer);
     drop(keys_timer);
 
     // From here through `drop(consts_timer)` below is the "consts"
@@ -12086,7 +12321,9 @@ extern "system" fn device_set_fvf(this: *mut c_void, fvf: u32) -> i32 {
     // A non-zero FVF binds its implicit declaration so GetVertexDeclaration
     // returns it and the draw path resolves the same layout it would from the
     // FVF directly. Redundant-set elimination: re-binding the same cached decl
-    // changes nothing, so skip the VDECL rebuild.
+    // changes nothing, so skip the VDECL rebuild; `bind_fvf_decl` answers
+    // that without the cache lookup when the FVF and its declaration are
+    // already bound.
     let changed = dev.bind_fvf_decl(fvf);
     if changed {
         // VS_SOURCE is marked unconditionally (not via `ff_aware_mask`, which

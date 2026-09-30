@@ -35,7 +35,7 @@ use mtld3d_types::{
 
 use crate::{
     LOG_TARGET,
-    caps::unimplemented_texture_op,
+    caps::{texture_op_unimplemented, unimplemented_texture_op},
     convert::FfVsLayout,
     dxso::{
         FfPsKey, FfStage, FfStageFlags, FfStageResult, FfVsFlags, FfVsKey, VariantFlags, VariantKey,
@@ -216,11 +216,12 @@ pub struct FfState {
     /// D3D9 lets `SetLight` / `LightEnable` address an unbounded set of indices;
     /// `MaxActiveLights` (8) caps only how many lights simultaneously contribute
     /// to a draw, not the addressable index range. Slots `0..8` live in the
-    /// `lights` array — the only slots the FF vertex shader reads — so they stay
-    /// on the fast path; higher indices are kept here purely so `GetLight` /
-    /// `GetLightEnable` round-trip. Overflow lights never feed FF lighting and,
-    /// like the array slots, are not captured by [`FfStateSnapshot`] beyond the
-    /// 8 fast-path slots. Empty for every workload that stays within 8 lights.
+    /// `lights` array with their masks, the fast path; higher indices live
+    /// here. An enabled overflow light with a non-zero type feeds FF lighting:
+    /// [`Self::resolve_active_lights`] packs it after the active fast-path
+    /// slots, up to [`MAX_ACTIVE_LIGHTS`], so its writes mark the LIGHTS
+    /// section like a fast-path write. [`FfStateSnapshot`] does not capture
+    /// these slots. Empty for every workload that stays within 8 lights.
     overflow_lights: BTreeMap<u32, OverflowLight>,
     texture_stage_states: [[u32; TEXTURE_STAGE_STATE_COUNT]; 8],
     /// Bit `s` set iff stage `s`'s `D3DTSS_TEXTURETRANSFORMFLAGS` is non-zero.
@@ -390,15 +391,12 @@ impl FfState {
     ///
     /// Returns `false` for unrecognised D3DTS_* indices (silently accepted by
     /// D3D9).
+    #[inline]
     pub fn set_transform(&mut self, state: u32, m: &D3DMATRIX) -> bool {
         self.bump_palette_high_water(state);
         let section = Self::transform_dirty_section(state);
         let Some(slot) = self.transform_slot_mut(state) else {
-            mtld3d_shared::log_once_warn_by!(
-                target: crate::LOG_TARGET,
-                key: u64::from(state),
-                "SetTransform: D3DTS_{state} not honoured — value dropped"
-            );
+            warn_set_transform_dropped(state);
             return false;
         };
         *slot = *m;
@@ -413,11 +411,7 @@ impl FfState {
         self.bump_palette_high_water(state);
         let section = Self::transform_dirty_section(state);
         let Some(slot) = self.transform_slot_mut(state) else {
-            mtld3d_shared::log_once_warn_by!(
-                target: crate::LOG_TARGET,
-                key: u64::from(state),
-                "MultiplyTransform: D3DTS_{state} not honoured — value dropped"
-            );
+            warn_multiply_transform_dropped(state);
             return false;
         };
         *slot = Self::mat_mul(slot, rhs);
@@ -491,9 +485,27 @@ impl FfState {
         &self.material
     }
 
-    pub fn set_material(&mut self, m: &D3DMATERIAL9) {
-        self.material = *m;
-        self.ff_vs_dirty |= FfVsDirty::MATERIAL;
+    /// Store the material and mark its constant section.
+    ///
+    /// Copied field by field: a whole-struct assignment of the 68-byte value
+    /// compiles to a CRT `memmove` call on i686, the fields to plain stores.
+    /// The exhaustive pattern makes a field added to the type fail to compile
+    /// here rather than go uncopied.
+    #[inline]
+    pub const fn set_material(&mut self, m: &D3DMATERIAL9) {
+        let D3DMATERIAL9 {
+            diffuse,
+            ambient,
+            specular,
+            emissive,
+            power,
+        } = m;
+        self.material.diffuse = *diffuse;
+        self.material.ambient = *ambient;
+        self.material.specular = *specular;
+        self.material.emissive = *emissive;
+        self.material.power = *power;
+        self.ff_vs_dirty = self.ff_vs_dirty.union(FfVsDirty::MATERIAL);
     }
 
     #[must_use]
@@ -584,6 +596,85 @@ impl FfState {
             }
         }
         out
+    }
+
+    /// The FF VS key's active, directional and spot light masks, over compacted shader slots.
+    ///
+    /// Bit `i` refers to compacted slot `i` of [`Self::resolve_active_lights`],
+    /// the packing order `build_lights_section` uses: the active mask is the
+    /// low `n` bits, and a slot with neither type bit is POINT.
+    fn compacted_light_masks(&self) -> [u8; 3] {
+        let active = self.resolve_active_lights();
+        let mut dir = 0u8;
+        let mut spot = 0u8;
+        for (i, l) in active.as_slice().iter().enumerate() {
+            let bit = 1u8 << i;
+            if l.ty == D3DLIGHT_DIRECTIONAL {
+                dir |= bit;
+            } else if l.ty == D3DLIGHT_SPOT {
+                spot |= bit;
+            }
+        }
+        // `len` ≤ MAX_ACTIVE_LIGHTS (8); the active mask is the low `len`
+        // bits set. `0xFFu8 >> (8 - len)` yields exactly that (and 0 for
+        // len == 0, all-ones for len == 8) without an overflowing shift.
+        let active_mask = if active.len == 0 {
+            0u8
+        } else {
+            0xFFu8 >> (8 - active.len)
+        };
+        [active_mask, dir, spot]
+    }
+
+    /// The FF VS source input a transform write can move: the world-palette high-water mark.
+    ///
+    /// [`Self::ff_vs_row_count`] sizes a blended draw's palette from it, and
+    /// nothing else a transform write changes reaches the FF VS key or row
+    /// count (matrices feed only the constant sections). So a `set_transform`
+    /// or `multiply_transform` call that leaves this value unchanged leaves
+    /// the FF VS source unchanged, and the device marks `VS_SOURCE` for it
+    /// only when the value moves. It is one field read, so a transform write
+    /// stays O(1) whatever lights exist.
+    #[must_use]
+    pub const fn vs_source_transform_inputs(&self) -> u16 {
+        self.world_palette_high_water
+    }
+
+    /// The FF VS source inputs a light write can move: which lights are active, with which type.
+    ///
+    /// These are the `FfState` fields behind the key's active, directional
+    /// and spot light masks in [`Self::build_vs_key`]. A light's parameters
+    /// feed only the constant sections, so a `set_light_at` or
+    /// `set_light_enabled_at` call that leaves this value unchanged leaves
+    /// the FF VS key and row count unchanged, and the device marks
+    /// `VS_SOURCE` for it only when the value moves. The texture-stage inputs
+    /// are not covered, since `SetTextureStageState` marks the source itself.
+    ///
+    /// With no light past the fast-path slots, the physical masks stand in
+    /// for the compacted ones, which they determine, and cost three `AND`s.
+    /// Otherwise the compacted masks are computed. A tag byte keeps the two
+    /// encodings from comparing equal.
+    #[inline]
+    #[must_use]
+    pub fn vs_source_light_inputs(&self) -> u32 {
+        if !self.overflow_lights.is_empty() {
+            return self.vs_source_compacted_light_inputs();
+        }
+        let active = self.light_active_mask();
+        u32::from_le_bytes([
+            active,
+            self.light_directional_mask & active,
+            self.light_spot_mask & active,
+            0,
+        ])
+    }
+
+    /// The [`Self::vs_source_light_inputs`] encoding with a light past the fast-path slots.
+    #[cold]
+    #[inline(never)]
+    fn vs_source_compacted_light_inputs(&self) -> u32 {
+        let [active, dir, spot] = self.compacted_light_masks();
+        u32::from_le_bytes([active, dir, spot, 1])
     }
 
     /// Bit `i` set iff the active light at slot `i` is DIRECTIONAL.
@@ -684,18 +775,32 @@ impl FfState {
     ///
     /// Slots `0..8` take the fast path and feed FF lighting; higher indices
     /// land in `overflow_lights` for `GetLight` round-trip only.
+    #[inline]
     pub fn set_light_at(&mut self, index: u32, light: &D3DLIGHT9) {
         if index < 8 {
             self.set_light(index as usize, light);
         } else {
-            self.overflow_lights
-                .entry(index)
-                .and_modify(|slot| slot.light = *light)
-                .or_insert(OverflowLight {
-                    light: *light,
-                    enabled: false,
-                });
+            self.set_overflow_light(index, light);
         }
+    }
+
+    /// The [`Self::set_light_at`] path for an index past the fast-path slots.
+    ///
+    /// Out of line and cold, so the map insert stays out of the setter the
+    /// thunk inlines.
+    #[cold]
+    #[inline(never)]
+    fn set_overflow_light(&mut self, index: u32, light: &D3DLIGHT9) {
+        self.overflow_lights
+            .entry(index)
+            .and_modify(|slot| slot.light = *light)
+            .or_insert(OverflowLight {
+                light: *light,
+                enabled: false,
+            });
+        // An enabled overflow light packs into the LIGHTS section through
+        // `resolve_active_lights`, the same as a fast-path slot.
+        self.ff_vs_dirty |= FfVsDirty::LIGHTS;
     }
 
     /// `GetLight` for any D3D9 light index.
@@ -715,18 +820,30 @@ impl FfState {
     ///
     /// An undefined slot first materializes the default light, matching the
     /// fast-path behavior.
+    #[inline]
     pub fn set_light_enabled_at(&mut self, index: u32, enabled: bool) {
         if index < 8 {
             self.set_light_enabled(index as usize, enabled);
         } else {
-            self.overflow_lights
-                .entry(index)
-                .or_insert_with(|| OverflowLight {
-                    light: Self::enable_default_light(),
-                    enabled: false,
-                })
-                .enabled = enabled;
+            self.set_overflow_light_enabled(index, enabled);
         }
+    }
+
+    /// The [`Self::set_light_enabled_at`] path for an index past the fast-path slots.
+    ///
+    /// Out of line and cold, so the map insert stays out of the setter the
+    /// thunk inlines.
+    #[cold]
+    #[inline(never)]
+    fn set_overflow_light_enabled(&mut self, index: u32, enabled: bool) {
+        self.overflow_lights
+            .entry(index)
+            .or_insert_with(|| OverflowLight {
+                light: Self::enable_default_light(),
+                enabled: false,
+            })
+            .enabled = enabled;
+        self.ff_vs_dirty |= FfVsDirty::LIGHTS;
     }
 
     /// `GetLightEnable` for any D3D9 light index.
@@ -815,6 +932,7 @@ impl FfState {
     /// Callers gate snapshot dirty-marking on this: a same-value write (very
     /// common in state-block restores) leaves every FF VS/PS key
     /// byte-identical.
+    #[inline]
     pub fn set_texture_stage_state(&mut self, stage: usize, ty: usize, value: u32) -> bool {
         self.warn_tss_non_default_once(stage, ty, value);
         if ty == D3DTSS_COLOROP as usize || ty == D3DTSS_ALPHAOP as usize {
@@ -850,16 +968,24 @@ impl FfState {
     /// whatever the cache holds. `slot` is `D3DTSS_COLOROP` or
     /// `D3DTSS_ALPHAOP`. A value outside the `D3DTOP_*` space is left to
     /// `stage_enum_value`, which reads it as the stage default.
+    #[inline]
     fn warn_unimplemented_texture_op_once(&mut self, stage: usize, slot: usize, op: u32) {
+        if !texture_op_unimplemented(op) || self.texture_op_warn_fired(slot, op) {
+            return;
+        }
+        self.log_unimplemented_texture_op_once(stage, slot, op);
+    }
+
+    /// Mark the latch of an unimplemented operation not yet reported, then warn.
+    #[cold]
+    #[inline(never)]
+    fn log_unimplemented_texture_op_once(&mut self, stage: usize, slot: usize, op: u32) {
         let Some(name) = unimplemented_texture_op(op) else {
             return;
         };
         let Some(bit) = texture_op_warn_bit(slot, op) else {
             return;
         };
-        if self.texture_op_warn_fired(slot, op) {
-            return;
-        }
         self.texture_op_warn_fired |= bit;
         let slot_name = if slot == D3DTSS_COLOROP as usize {
             "D3DTSS_COLOROP"
@@ -872,6 +998,11 @@ impl FfState {
         );
     }
 
+    /// The silent-write audit of one texture-stage-state write.
+    ///
+    /// The tests stay inline, so the setter can inline this; the latch mark
+    /// and every log line live in cold functions.
+    #[inline]
     fn warn_tss_non_default_once(&mut self, stage: usize, ty: usize, value: u32) {
         static TSS_DEFAULTS: [[u32; TEXTURE_STAGE_STATE_COUNT]; 8] = [
             texture_stage_state_defaults(0),
@@ -887,34 +1018,35 @@ impl FfState {
         if stage >= 8 || ty >= TEXTURE_STAGE_STATE_COUNT {
             return;
         }
-        if value == TSS_DEFAULTS[stage][ty] {
+        let default = TSS_DEFAULTS[stage][ty];
+        if value == default {
             if crate::state_trace::enabled() {
-                log::trace!(
-                    target: crate::state_trace::TARGET,
-                    "D3DTSS_{ty} (stage {stage}) = {value:#x} (default — write suppressed in warn machinery)"
-                );
+                trace_default_tss(stage, ty, value);
             }
             return;
         }
         if self.tss_warn_fired(stage, ty) {
             return;
         }
-        let class = tss_classify(
-            u32::try_from(ty).expect("D3DTSS type fits u32 by TEXTURE_STAGE_STATE_COUNT bound"),
-        );
-        if matches!(class, TssClass::Consumed) {
+        let tss =
+            u32::try_from(ty).expect("D3DTSS type fits u32 by TEXTURE_STAGE_STATE_COUNT bound");
+        if matches!(tss_classify(tss), TssClass::Consumed) {
             if crate::state_trace::enabled() {
-                let default = TSS_DEFAULTS[stage][ty];
-                log::trace!(
-                    target: crate::state_trace::TARGET,
-                    "D3DTSS_{ty} (stage {stage}) Consumed = {value:#x} (default {default:#x})"
-                );
+                trace_consumed_tss(stage, ty, value, default);
             }
             return;
         }
+        self.log_unconsumed_tss_once(stage, ty, value, default);
+    }
+
+    /// Mark the once-per-slot latch of an unconsumed write, then format its diagnostic.
+    #[cold]
+    #[inline(never)]
+    fn log_unconsumed_tss_once(&mut self, stage: usize, ty: usize, value: u32, default: u32) {
         self.mark_tss_warn(stage, ty);
-        let default = TSS_DEFAULTS[stage][ty];
-        match class {
+        let tss =
+            u32::try_from(ty).expect("D3DTSS type fits u32 by TEXTURE_STAGE_STATE_COUNT bound");
+        match tss_classify(tss) {
             TssClass::Consumed => {} // unreachable
             TssClass::NotImplemented => {
                 log::warn!(
@@ -1107,29 +1239,10 @@ impl FfState {
         // equals the physical slots, so these masks are byte-identical to the
         // pre-compaction `light_active_mask()` / `light_directional_mask()` /
         // `light_spot_mask()`.
-        let (light_active_mask, light_directional_mask, light_spot_mask) = if lighting_enabled {
-            let active = self.resolve_active_lights();
-            let mut dir = 0u8;
-            let mut spot = 0u8;
-            for (i, l) in active.as_slice().iter().enumerate() {
-                let bit = 1u8 << i;
-                if l.ty == D3DLIGHT_DIRECTIONAL {
-                    dir |= bit;
-                } else if l.ty == D3DLIGHT_SPOT {
-                    spot |= bit;
-                }
-            }
-            // `len` ≤ MAX_ACTIVE_LIGHTS (8); the active mask is the low `len`
-            // bits set. `0xFFu8 >> (8 - len)` yields exactly that (and 0 for
-            // len == 0, all-ones for len == 8) without an overflowing shift.
-            let active_mask = if active.len == 0 {
-                0u8
-            } else {
-                0xFFu8 >> (8 - active.len)
-            };
-            (active_mask, dir, spot)
+        let [light_active_mask, light_directional_mask, light_spot_mask] = if lighting_enabled {
+            self.compacted_light_masks()
         } else {
-            (0, 0, 0)
+            [0; 3]
         };
         // Decode per-stage TCI mode + input coord-set index from
         // `D3DTSS_TEXCOORDINDEX`, and texture-transform flags from
@@ -2146,25 +2259,49 @@ fn build_vs_flags(
 /// selector names no source, reads as that stage's D3D9 default and surfaces
 /// once. The emitter's own arms still handle the codes that are in the space
 /// but unimplemented.
+#[inline]
 fn stage_enum_value(stage_states: &[u32; TEXTURE_STAGE_STATE_COUNT], stage: u8, ty: u32) -> u8 {
     let value = stage_states[ty as usize];
-    // Exact for every value the spaces below accept: both fit in a byte.
-    let byte = value.to_le_bytes()[0];
-    let fits = u32::from(byte) == value;
-    let in_space = match ty {
-        D3DTSS_RESULTARG => matches!(value, D3DTA_CURRENT | D3DTA_TEMP),
-        D3DTSS_COLOROP | D3DTSS_ALPHAOP => fits && (D3DTOP_DISABLE..=D3DTOP_LERP).contains(&value),
+    if stage_value_in_space(ty, value) == Some(true) {
+        // Exact: every value a space accepts fits in a byte.
+        return value.to_le_bytes()[0];
+    }
+    stage_enum_value_outside(stage_states, stage, ty)
+}
+
+/// Whether `value` lies in the value space of D3DTSS state `ty`; `None` when `ty` has none.
+const fn stage_value_in_space(ty: u32, value: u32) -> Option<bool> {
+    let fits = value <= 0xff;
+    match ty {
+        D3DTSS_RESULTARG => Some(matches!(value, D3DTA_CURRENT | D3DTA_TEMP)),
+        D3DTSS_COLOROP | D3DTSS_ALPHAOP => {
+            Some(fits && D3DTOP_DISABLE <= value && value <= D3DTOP_LERP)
+        }
         D3DTSS_COLORARG1 | D3DTSS_COLORARG2 | D3DTSS_ALPHAARG1 | D3DTSS_ALPHAARG2 => {
-            fits && value & !(D3DTA_COMPLEMENT | D3DTA_ALPHAREPLICATE) <= D3DTA_CONSTANT
+            Some(fits && value & !(D3DTA_COMPLEMENT | D3DTA_ALPHAREPLICATE) <= D3DTA_CONSTANT)
         }
-        other => {
-            mtld3d_shared::log_once_warn_by!(target: crate::LOG_TARGET, key: u64::from(other),
-                "FF: D3DTSS_{other} narrowed as an enum but carries no enum space → low byte {byte:#x}"
-            );
-            return byte;
-        }
-    };
-    if in_space {
+        _ => None,
+    }
+}
+
+/// The byte [`stage_enum_value`] reads for a value its fast path rejected, with its warning.
+///
+/// Out of line and cold so the warn-once formatting stays out of the key
+/// builders that inline the fast path. Only called for a `ty` with no value
+/// space or a value outside it.
+#[cold]
+#[inline(never)]
+fn stage_enum_value_outside(
+    stage_states: &[u32; TEXTURE_STAGE_STATE_COUNT],
+    stage: u8,
+    ty: u32,
+) -> u8 {
+    let value = stage_states[ty as usize];
+    let byte = value.to_le_bytes()[0];
+    if stage_value_in_space(ty, value).is_none() {
+        mtld3d_shared::log_once_warn_by!(target: crate::LOG_TARGET, key: u64::from(ty),
+            "FF: D3DTSS_{ty} narrowed as an enum but carries no enum space → low byte {byte:#x}"
+        );
         return byte;
     }
     let default = texture_stage_state_defaults(stage)[ty as usize];
@@ -2383,6 +2520,9 @@ impl FfStateSnapshot {
         ff.light_spot_mask = self.light_spot_mask;
         ff.texture_stage_states = self.texture_stage_states;
         ff.recompute_tt_active_mask();
+        // The arrays were written past the setters, so the constant sections
+        // they feed are marked here; every section reads something restored.
+        ff.ff_vs_dirty |= FfVsDirty::all();
     }
 
     /// Restore only the fixed-function state a `block_type` state block owns.
@@ -2444,6 +2584,15 @@ impl FfStateSnapshot {
             }
         }
         ff.recompute_tt_active_mask();
+        // The fields were written past the setters, so the constant sections
+        // they feed are marked here: the stage states can move the TT extent
+        // for every block type, the lights feed LIGHTS for a vertex block, and
+        // an ALL block rewrites every matrix and the material as well.
+        ff.ff_vs_dirty |= match block_type {
+            StateBlockType::All => FfVsDirty::all(),
+            StateBlockType::Vertex => FfVsDirty::LIGHTS | FfVsDirty::TT,
+            StateBlockType::Pixel => FfVsDirty::TT,
+        };
     }
 }
 
@@ -2523,6 +2672,48 @@ const fn texture_op_warn_bit(slot: usize, op: u32) -> Option<u64> {
         return None;
     };
     Some(1u64 << (base + op))
+}
+
+/// Warn once per state that `SetTransform` dropped a `D3DTS_*` index nothing honours.
+#[cold]
+#[inline(never)]
+fn warn_set_transform_dropped(state: u32) {
+    mtld3d_shared::log_once_warn_by!(
+        target: crate::LOG_TARGET,
+        key: u64::from(state),
+        "SetTransform: D3DTS_{state} not honoured — value dropped"
+    );
+}
+
+/// Warn once per state that `MultiplyTransform` dropped a `D3DTS_*` index nothing honours.
+#[cold]
+#[inline(never)]
+fn warn_multiply_transform_dropped(state: u32) {
+    mtld3d_shared::log_once_warn_by!(
+        target: crate::LOG_TARGET,
+        key: u64::from(state),
+        "MultiplyTransform: D3DTS_{state} not honoured — value dropped"
+    );
+}
+
+/// Trace a texture-stage-state write of the D3D9 default.
+#[cold]
+#[inline(never)]
+fn trace_default_tss(stage: usize, ty: usize, value: u32) {
+    log::trace!(
+        target: crate::state_trace::TARGET,
+        "D3DTSS_{ty} (stage {stage}) = {value:#x} (default — write suppressed in warn machinery)"
+    );
+}
+
+/// Trace a non-default texture-stage-state write to a consumed slot.
+#[cold]
+#[inline(never)]
+fn trace_consumed_tss(stage: usize, ty: usize, value: u32, default: u32) {
+    log::trace!(
+        target: crate::state_trace::TARGET,
+        "D3DTSS_{ty} (stage {stage}) Consumed = {value:#x} (default {default:#x})"
+    );
 }
 
 #[cfg(test)]
