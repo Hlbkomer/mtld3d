@@ -3177,6 +3177,84 @@ fn volume_update_keeps_per_draw_content() {
     }
 }
 
+/// A whole-level volume write between two draws leaves the first draw its texels.
+///
+/// The level is written before the frame and uploaded by the first draw, whose
+/// upload still reads the staging when `UpdateTexture` or a whole `LockBox`
+/// rewrites every slice of it.
+#[test]
+fn volume_whole_level_write_after_its_upload_keeps_per_draw_content() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    let harnesses = [
+        Harness::new(),
+        Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true"),
+    ];
+    for h in &harnesses {
+        for lock_box in [false, true] {
+            let (hr, source) =
+                h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+            assert_eq!(hr, 0);
+            let source = source.expect("source");
+            let pool = if lock_box {
+                D3DPOOL_MANAGED
+            } else {
+                D3DPOOL_DEFAULT
+            };
+            let (hr, destination) =
+                h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, pool);
+            assert_eq!(hr, 0);
+            let destination = destination.expect("destination");
+            if lock_box {
+                destination.write_u32(0, &[RED; 64]);
+            } else {
+                source.write_u32(0, &[RED; 64]);
+                assert_eq!(h.update_volume_texture_hr(&source, &destination), 0);
+                source.write_u32(0, &[BLUE; 64]);
+            }
+            assert_eq!(h.set_volume_texture(0, &destination), 0);
+            h.select_texture_stage(0);
+            point_clamp(h);
+            assert_eq!(
+                h.set_fvf(
+                    D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)
+                ),
+                0
+            );
+            h.render_once(BLACK, |d| {
+                assert_eq!(
+                    d.draw_primitive_up(
+                        D3DPT_TRIANGLELIST,
+                        2,
+                        &volume_sample_quad(-1.0, 0.0, [0.5, 0.5, 0.875])
+                    ),
+                    0
+                );
+                if lock_box {
+                    destination.write_u32(0, &[BLUE; 64]);
+                } else {
+                    assert_eq!(d.update_volume_texture_hr(&source, &destination), 0);
+                }
+                assert_eq!(
+                    d.draw_primitive_up(
+                        D3DPT_TRIANGLELIST,
+                        2,
+                        &volume_sample_quad(0.0, 1.0, [0.5, 0.5, 0.875])
+                    ),
+                    0
+                );
+            });
+            let pixels = [h.read_pixel(160, 240), h.read_pixel(480, 240)];
+            assert_eq!(
+                pixels,
+                [RED, BLUE],
+                "volume draws bracketing a whole-level write, LockBox={lock_box}"
+            );
+            assert_eq!(h.clear_texture(0), 0);
+        }
+    }
+}
+
 /// A partial volume update preserves earlier draws and every unwritten subresource.
 #[test]
 fn volume_partial_update_keeps_versions_and_untouched_mips() {
@@ -4886,11 +4964,432 @@ fn intra_frame_rename_preserves_earlier_upload_outside_patch() {
             0
         );
     });
-    // The earlier sample stays outside the patch, so an in-place staging
-    // update cannot affect this control.
+    // The first draw's upload still reads the level when the patch lands, so
+    // it keeps the texel the patch replaces as well as the one it leaves.
+    assert_pixel_eq(h.read_pixel(160, 120), RED, "earlier texel under the patch");
     assert_pixel_eq(h.read_pixel(240, 360), RED, "earlier untouched texel");
     assert_pixel_eq(h.read_pixel(400, 120), BLUE, "updated texel");
     assert_pixel_eq(h.read_pixel(560, 360), RED, "preserved untouched texel");
+}
+
+/// Draw `texture` over the left half, run `between`, then draw it over the right half.
+///
+/// Both draws belong to one presented frame. Returns the centre pixel of each
+/// half, so the first reads what the texture held at the first draw and the
+/// second what it held after `between`.
+fn draws_bracketing(
+    h: &Harness,
+    texture: &Texture<'_>,
+    between: impl FnOnce(&Harness),
+) -> [u32; 2] {
+    assert_eq!(h.set_texture(0, texture), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(h);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &horizontal_quad(-1.0, 0.0)),
+            0,
+            "left draw"
+        );
+        between(d);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &horizontal_quad(0.0, 1.0)),
+            0,
+            "right draw"
+        );
+    });
+    [h.read_pixel(160, 240), h.read_pixel(480, 240)]
+}
+
+/// A same-format `UpdateSurface` between two draws leaves the first draw its texels.
+///
+/// The level is written before the frame and uploaded by the first draw, whose
+/// upload still reads the level's staging when the copy lands.
+#[test]
+fn intra_frame_update_surface_keeps_per_draw_content() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let texture = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let red = h.create_offscreen_plain_surface(2, 2, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    red.lock_rect(0).write_u32(&[RED; 4]);
+    let blue = h.create_offscreen_plain_surface(2, 2, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    blue.lock_rect(0).write_u32(&[BLUE; 4]);
+    let level = texture.surface_level(0);
+    assert_eq!(h.update_surface_hr(&red, &level), 0, "UpdateSurface red");
+    let pixels = draws_bracketing(&h, &texture, |d| {
+        assert_eq!(d.update_surface_hr(&blue, &level), 0, "UpdateSurface blue");
+    });
+    assert_eq!(
+        pixels,
+        [RED, BLUE],
+        "draws bracketing a same-format UpdateSurface"
+    );
+}
+
+/// A copy into a level the game holds mapped lands in the pages the lock points into.
+///
+/// A partial `LockRect` of a level an upload still reads is handed out in
+/// place, and `UpdateTexture` validates no lock state. What the game writes
+/// through the lock after the copy has to reach the texture at `UnlockRect`,
+/// so the copy must not move the level to pages the lock pointer misses.
+#[test]
+fn update_texture_into_a_locked_level_keeps_the_lock_writes() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let texture = h.create_texture(2, 2, 1, D3DUSAGE_DYNAMIC, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    texture.lock_rect(0, 0).write_u32(&[RED; 4]);
+    let blue = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    blue.lock_rect(0, 0).write_u32(&[BLUE; 4]);
+    draws_bracketing(&h, &texture, |d| {
+        let mut locked = texture.lock_rect_partial(0, &[1, 0, 2, 1], 0);
+        assert_eq!(d.update_texture_hr(&blue, &texture), 0, "UpdateTexture");
+        locked.write_u32(&[GREEN]);
+    });
+    assert_pixel_eq(
+        h.read_pixel(560, 120),
+        GREEN,
+        "texel written through the lock",
+    );
+    assert_pixel_eq(h.read_pixel(400, 360), BLUE, "texel the copy wrote");
+}
+
+/// A partial copy lands in place until a draw samples the level, then moves to fresh pages.
+///
+/// Each `UpdateTexture` into a static DEFAULT texture schedules its upload at
+/// once, so the second copy finds the first one's upload still reading the
+/// staging. Nothing recorded between the two can see those pages, so the
+/// second copy writes in place without copying the level: a read-only lock
+/// finds the same pages before and after it. After a draw has sampled the
+/// texture the next partial copy renames. The three copies still sample as
+/// one level.
+#[test]
+fn partial_updates_stay_in_place_until_a_draw_samples_the_level() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let texture = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let source = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    source.lock_rect(0, 0).write_u32(&[RED; 4]);
+    let pages = || texture.lock_rect(0, D3DLOCK_READONLY).bits_ptr();
+    assert_eq!(h.set_texture(0, &texture), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(h.update_texture_hr(&source, &texture), 0, "whole copy");
+    let first = pages();
+    source
+        .lock_rect_partial(0, &[0, 0, 1, 1], 0)
+        .write_u32(&[GREEN]);
+    assert_eq!(
+        h.update_texture_hr(&source, &texture),
+        0,
+        "first partial copy"
+    );
+    assert_eq!(
+        pages(),
+        first,
+        "a partial copy with no GPU use since the pending upload lands in place"
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fullscreen_quad()),
+        0,
+        "sampling draw"
+    );
+    source
+        .lock_rect_partial(0, &[1, 1, 2, 2], 0)
+        .write_u32(&[BLUE]);
+    assert_eq!(
+        h.update_texture_hr(&source, &texture),
+        0,
+        "second partial copy"
+    );
+    assert_ne!(
+        pages(),
+        first,
+        "a partial copy after a draw sampled the level moves to fresh pages"
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+    assert_eq!(h.present(), 0, "Present");
+    assert_eq!(
+        [
+            sample_at(&h, &texture, 160, 120).to_pixel(),
+            sample_at(&h, &texture, 480, 120).to_pixel(),
+            sample_at(&h, &texture, 480, 360).to_pixel(),
+        ],
+        [GREEN, RED, BLUE],
+        "the level after the three copies"
+    );
+}
+
+/// Fills over an unseen upload, in its own frame and the next, all reach the surface.
+///
+/// A `ColorFill` of an offscreen-plain surface schedules its upload with no
+/// GPU use behind it, so a second fill in the same frame lands in place: a
+/// read-only lock finds the same pages. A third fill after the frame is
+/// handed off may find that upload still replaying, and whether it renames
+/// then depends on when the GPU retires the upload, so only the pixels are
+/// pinned for it; `decide_staging_write`'s unit tests pin the frame rule.
+#[test]
+fn fills_over_an_unseen_upload_reach_the_surface_across_frames() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let surface = h.create_offscreen_plain_surface(4, 4, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    let pages = || surface.lock_rect(D3DLOCK_READONLY).bits_ptr();
+    assert_eq!(h.color_fill_hr(&surface, RED), 0, "whole fill");
+    let first = pages();
+    assert_eq!(
+        h.color_fill_rect_hr(&surface, (0, 0, 2, 4), GREEN),
+        0,
+        "partial fill in the same frame"
+    );
+    assert_eq!(
+        pages(),
+        first,
+        "a fill over this frame's unseen upload lands in place"
+    );
+    h.render_once(BLACK, |_| {});
+    assert_eq!(
+        h.color_fill_rect_hr(&surface, (2, 2, 4, 4), BLUE),
+        0,
+        "partial fill in the next frame"
+    );
+    let back_buffer = h.render_target(0);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.stretch_rect(&surface, &back_buffer, D3DTEXF_POINT),
+            0,
+            "StretchRect the surface over the back buffer"
+        );
+    });
+    assert_eq!(
+        [
+            h.read_pixel(160, 240),
+            h.read_pixel(480, 120),
+            h.read_pixel(480, 360),
+        ],
+        [GREEN, RED, BLUE],
+        "the surface after the three fills"
+    );
+}
+
+/// A partial copy, a draw, another partial copy and a draw each sample their own version.
+///
+/// The first partial copy lands in place over the whole copy's pending
+/// upload, which no draw has sampled; the second follows a draw that did and
+/// moves to fresh pages carrying the first copy's texels.
+#[test]
+fn intra_frame_partial_update_texture_keeps_per_draw_content() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let texture = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let source = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    source.lock_rect(0, 0).write_u32(&[RED; 4]);
+    assert_eq!(h.update_texture_hr(&source, &texture), 0, "whole copy");
+    source
+        .lock_rect_partial(0, &[0, 0, 1, 1], 0)
+        .write_u32(&[GREEN]);
+    assert_eq!(
+        h.update_texture_hr(&source, &texture),
+        0,
+        "first partial copy"
+    );
+    draws_bracketing(&h, &texture, |d| {
+        source
+            .lock_rect_partial(0, &[1, 1, 2, 2], 0)
+            .write_u32(&[BLUE]);
+        assert_eq!(
+            d.update_texture_hr(&source, &texture),
+            0,
+            "second partial copy"
+        );
+    });
+    assert_eq!(
+        [
+            h.read_pixel(80, 120),
+            h.read_pixel(240, 360),
+            h.read_pixel(400, 120),
+            h.read_pixel(560, 360),
+        ],
+        [GREEN, RED, GREEN, BLUE],
+        "left draw before the second partial copy, right draw after it"
+    );
+}
+
+/// A same-format `UpdateTexture` between two draws leaves the first draw its texels.
+///
+/// Each update schedules its upload at once, so both uploads of the level sit
+/// in the frame and the first still reads the staging when the second copy
+/// lands.
+#[test]
+fn intra_frame_update_texture_keeps_per_draw_content() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let texture = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let red = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    red.lock_rect(0, 0).write_u32(&[RED; 4]);
+    let blue = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    blue.lock_rect(0, 0).write_u32(&[BLUE; 4]);
+    assert_eq!(h.update_texture_hr(&red, &texture), 0, "UpdateTexture red");
+    let pixels = draws_bracketing(&h, &texture, |d| {
+        assert_eq!(
+            d.update_texture_hr(&blue, &texture),
+            0,
+            "UpdateTexture blue"
+        );
+    });
+    assert_eq!(
+        pixels,
+        [RED, BLUE],
+        "draws bracketing a same-format UpdateTexture"
+    );
+}
+
+/// A cube face rewritten between two draws leaves the first draw its texels.
+///
+/// The face is written before the frame and uploaded by the first draw, then
+/// rewritten whole by `UpdateSurface` from a standalone surface and by
+/// `UpdateTexture` from a system-memory cube, the two raw-copy paths into a
+/// cube face.
+#[test]
+fn intra_frame_cube_face_rewrite_keeps_per_draw_content() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    const SIZE: u32 = 4;
+    const TEXELS: usize = (SIZE * SIZE) as usize;
+    let h = Harness::new();
+    let quad = |left, right| {
+        [
+            cube_vertex(left, 1.0, -1.0),
+            cube_vertex(right, 1.0, -1.0),
+            cube_vertex(left, -1.0, -1.0),
+            cube_vertex(right, 1.0, -1.0),
+            cube_vertex(right, -1.0, -1.0),
+            cube_vertex(left, -1.0, -1.0),
+        ]
+    };
+    for update_texture in [false, true] {
+        let cube = h.create_cube_texture_owned(SIZE, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+        let face = cube.surface(1, 0);
+        let red = h.create_offscreen_plain_surface(SIZE, SIZE, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+        red.lock_rect(0).write_u32(&[RED; TEXELS]);
+        assert_eq!(h.update_surface_hr(&red, &face), 0, "UpdateSurface red");
+        let blue_surface =
+            h.create_offscreen_plain_surface(SIZE, SIZE, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+        blue_surface.lock_rect(0).write_u32(&[BLUE; TEXELS]);
+        let blue_cube = h.create_cube_texture_owned(SIZE, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+        blue_cube.lock_rect(1, 0, 0).write_u32(&[BLUE; TEXELS]);
+        assert_eq!(h.set_cube_texture(0, &cube), 0);
+        h.select_texture_stage(0);
+        point_clamp(&h);
+        // D3DFVF_TEXCOORDSIZE3(0) is bit 16.
+        assert_eq!(
+            h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | 0x0001_0000),
+            0
+        );
+        h.render_once(BLACK, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(-1.0, 0.0)),
+                0
+            );
+            let hr = if update_texture {
+                d.update_cube_texture_hr(&blue_cube, &cube)
+            } else {
+                d.update_surface_hr(&blue_surface, &face)
+            };
+            assert_eq!(hr, 0, "blue face update, UpdateTexture={update_texture}");
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(0.0, 1.0)),
+                0
+            );
+        });
+        assert_eq!(
+            [h.read_pixel(160, 240), h.read_pixel(480, 240)],
+            [RED, BLUE],
+            "cube draws bracketing a face rewrite, UpdateTexture={update_texture}"
+        );
+        assert_eq!(h.clear_texture(0), 0);
+    }
+}
+
+/// `GetDC` drawing between two draws leaves the first draw its texels.
+///
+/// The level is locked before the frame and uploaded by the first draw; the
+/// device context maps the same staging that upload still reads.
+#[test]
+fn intra_frame_get_dc_keeps_per_draw_content() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    const BLUE_COLORREF: u32 = 0x00FF_0000;
+    let h = Harness::new();
+    let texture = h.create_texture(1, 1, 1, 0, D3DFMT_X8R8G8B8, D3DPOOL_MANAGED);
+    texture.lock_rect(0, 0).write_u32(&[RED]);
+    let level = texture.surface_level(0);
+    let pixels = draws_bracketing(&h, &texture, |_| {
+        let dc = level.dc();
+        assert_eq!(dc.set_pixel(0, 0, BLUE_COLORREF), BLUE_COLORREF, "SetPixel");
+        assert_eq!(dc.release(), 0, "ReleaseDC");
+    });
+    // RGB only: GDI stores 0 in the X8 byte, and a paravirtual device samples it as alpha.
+    assert_eq!(
+        pixels.map(|pixel| pixel & 0x00FF_FFFF),
+        [RED & 0x00FF_FFFF, BLUE & 0x00FF_FFFF],
+        "draws bracketing a GetDC write"
+    );
+}
+
+/// A `ColorFill` of an offscreen-plain surface between two reads of it keeps each read's colour.
+///
+/// The fill lands in the surface's staging and schedules an upload, which the
+/// first `StretchRect` reads through; the second fill must not reach it.
+#[test]
+fn intra_frame_color_fill_keeps_the_earlier_stretch_source() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let back_buffer = h.render_target(0);
+    let surface = h.create_offscreen_plain_surface(4, 4, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.color_fill_hr(&surface, RED), 0, "ColorFill red");
+        assert_eq!(
+            d.stretch_rect_rects(
+                &surface,
+                (0, 0, 4, 4),
+                &back_buffer,
+                (0, 0, 320, 480),
+                D3DTEXF_POINT
+            ),
+            0,
+            "StretchRect to the left half"
+        );
+        assert_eq!(d.color_fill_hr(&surface, BLUE), 0, "ColorFill blue");
+        assert_eq!(
+            d.stretch_rect_rects(
+                &surface,
+                (0, 0, 4, 4),
+                &back_buffer,
+                (320, 0, 640, 480),
+                D3DTEXF_POINT
+            ),
+            0,
+            "StretchRect to the right half"
+        );
+    });
+    assert_eq!(
+        [h.read_pixel(160, 240), h.read_pixel(480, 240)],
+        [RED, BLUE],
+        "StretchRects bracketing a ColorFill of their source"
+    );
 }
 
 /// Each renamed autogen texture generates its mip chain after its own upload.
